@@ -1,0 +1,595 @@
+mod browser;
+mod config;
+mod diff;
+mod editor;
+mod filetree;
+mod git;
+mod gitpanel;
+mod ipc;
+mod pane;
+mod tab;
+mod theme;
+
+use gtk4::prelude::*;
+use gtk4::{gdk, Application, ApplicationWindow, Notebook};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use vte4::prelude::*;
+use webkit6::prelude::WebViewExt as _;
+
+const APP_ID: &str = "com.travismedia.sidekick";
+
+fn main() -> glib::ExitCode {
+    let app = Application::builder().application_id(APP_ID).build();
+    app.connect_activate(build_ui);
+    app.run()
+}
+
+fn build_ui(app: &Application) {
+    let cfg = Rc::new(config::Config::load());
+
+    let ipc_rx = ipc::start();
+
+    let notebook = Notebook::new();
+    notebook.set_scrollable(true);
+    notebook.set_show_border(false);
+
+    // File tree
+    let (tree_header, tree_view, tree_store, tree_scroll) = filetree::build();
+    let tree_store = Rc::new(tree_store);
+
+    // Git panel
+    let (git_panel, git_list_header, git_list) = gitpanel::build();
+    let git_files: Rc<RefCell<Vec<git::GitFile>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // Vertical paned inside sidebar: file tree (top) | git changes (bottom)
+    let sidebar_paned = gtk4::Paned::new(gtk4::Orientation::Vertical);
+    sidebar_paned.set_start_child(Some(&tree_scroll));
+    sidebar_paned.set_end_child(Some(&git_panel));
+    sidebar_paned.set_shrink_start_child(false);
+    sidebar_paned.set_shrink_end_child(false);
+    sidebar_paned.set_resize_start_child(true);
+    sidebar_paned.set_resize_end_child(false);
+    sidebar_paned.set_position(360);
+
+    // Sidebar container
+    let tree_sidebar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    tree_sidebar.set_width_request(260);
+    tree_sidebar.add_css_class("sidebar");
+    tree_sidebar.append(&tree_header);
+    tree_sidebar.append(&sidebar_paned);
+
+    // Browser panel (hidden by default)
+    let browser_panel = browser::build();
+    browser_panel.widget.set_visible(false);
+    browser_panel.widget.set_hexpand(true);
+
+    // Content paned: notebook | browser
+    let content_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+    content_paned.set_start_child(Some(&notebook));
+    content_paned.set_end_child(Some(&browser_panel.widget));
+    content_paned.set_shrink_start_child(false);
+    content_paned.set_shrink_end_child(false);
+    content_paned.set_resize_start_child(true);
+    content_paned.set_resize_end_child(true);
+
+    // Root paned: sidebar | content_paned
+    let root_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+    root_paned.set_start_child(Some(&tree_sidebar));
+    root_paned.set_end_child(Some(&content_paned));
+    root_paned.set_shrink_start_child(false);
+    root_paned.set_shrink_end_child(false);
+    root_paned.set_resize_start_child(false);
+    root_paned.set_resize_end_child(true);
+    root_paned.set_position(260);
+
+    // Sidebar visible by default
+    let sidebar_visible: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+    let browser_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+    add_tab(&notebook, &cfg, None);
+
+    let css = gtk4::CssProvider::new();
+    css.load_from_string(&build_css(&cfg));
+    gtk4::style_context_add_provider_for_display(
+        &gdk::Display::default().unwrap(),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("sidekick")
+        .default_width(1400)
+        .default_height(800)
+        .child(&root_paned)
+        .build();
+
+    // Track last known cwd to avoid redundant tree reloads
+    let last_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+    // Poll active terminal's cwd; refresh file tree and git panel when it changes
+    {
+        let nb = notebook.clone();
+        let store = Rc::clone(&tree_store);
+        let last = Rc::clone(&last_cwd);
+        let win = window.clone();
+        let header = tree_header.clone();
+        let git_list_c = git_list.clone();
+        let git_hdr_c = git_list_header.clone();
+        let git_files_c = Rc::clone(&git_files);
+        glib::timeout_add_seconds_local(1, move || {
+            if let Some(cwd) = focused_terminal_cwd(&win, &nb) {
+                let mut prev = last.borrow_mut();
+                if *prev != cwd {
+                    *prev = cwd.clone();
+                    filetree::populate(&store, &cwd);
+                    let name = std::path::Path::new(&cwd)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| cwd.clone());
+                    header.set_text(&name);
+                }
+                // Refresh git panel on every tick (fast for local repos)
+                let files = git::changed_files(&cwd);
+                let count = files.len();
+                git_hdr_c.set_text(
+                    if count > 0 {
+                        format!("GIT CHANGES ({})", count)
+                    } else {
+                        "GIT CHANGES".to_string()
+                    }
+                    .as_str(),
+                );
+                gitpanel::populate(&git_list_c, &files);
+                *git_files_c.borrow_mut() = files;
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // Open diff tab when a changed file is clicked in the git panel
+    {
+        let files_ref = Rc::clone(&git_files);
+        let nb_c = notebook.clone();
+        let last_cwd_c = Rc::clone(&last_cwd);
+        git_list.connect_row_activated(move |_, row| {
+            let name = row.widget_name().to_string();
+            let (staged, rel_path) = if let Some(r) = name.strip_prefix("s:") {
+                (true, r.to_string())
+            } else if let Some(r) = name.strip_prefix("u:") {
+                (false, r.to_string())
+            } else {
+                (false, name.clone())
+            };
+            let files = files_ref.borrow();
+            if let Some(file) = files
+                .iter()
+                .find(|f| f.rel_path == rel_path && f.staged == staged)
+            {
+                let cwd = last_cwd_c.borrow().clone();
+                if let Some(root) = git::repo_root(&cwd) {
+                    let diff_text = git::file_diff(&root, file);
+                    diff::open_readonly(&file.rel_path, &diff_text, &nb_c);
+                }
+            }
+        });
+    }
+
+    let key_ctrl = gtk4::EventControllerKey::new();
+    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let nb = notebook.clone();
+        let cfg = Rc::clone(&cfg);
+        let win = window.clone();
+        let paned = root_paned.clone();
+        let sidebar_vis = Rc::clone(&sidebar_visible);
+        let scroll = tree_sidebar.clone();
+        let browser_vis = Rc::clone(&browser_visible);
+        let browser_wgt = browser_panel.widget.clone();
+        let browser_wv = browser_panel.webview.clone();
+        let cpaned = content_paned.clone();
+        key_ctrl.connect_key_pressed(move |_, key, _, mods| {
+            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+            let alt = mods.contains(gdk::ModifierType::ALT_MASK);
+
+            match (ctrl, shift, alt, key) {
+                // New tab
+                (true, true, false, gdk::Key::t | gdk::Key::T) => {
+                    let cwd = focused_terminal_cwd(&win, &nb);
+                    add_tab(&nb, &cfg, cwd.as_deref());
+                    glib::Propagation::Stop
+                }
+                // Close pane / tab (also closes editor tabs)
+                (true, true, false, gdk::Key::w | gdk::Key::W) => {
+                    if gtk4::prelude::GtkWindowExt::focus(&win)
+                        .and_then(|w| w.downcast::<vte4::Terminal>().ok())
+                        .is_some()
+                    {
+                        pane::close(&win, &nb);
+                    } else {
+                        // Editor tab or other — just remove current page
+                        if let Some(idx) = nb.current_page() {
+                            nb.remove_page(Some(idx));
+                            if nb.n_pages() == 0 {
+                                std::process::exit(0);
+                            }
+                        }
+                    }
+                    glib::Propagation::Stop
+                }
+                // Split right (side by side)
+                (true, true, false, gdk::Key::d | gdk::Key::D) => {
+                    pane::split(&win, &nb, &cfg, gtk4::Orientation::Horizontal);
+                    glib::Propagation::Stop
+                }
+                // Split down (top / bottom)
+                (true, true, false, gdk::Key::e | gdk::Key::E) => {
+                    pane::split(&win, &nb, &cfg, gtk4::Orientation::Vertical);
+                    glib::Propagation::Stop
+                }
+                // Navigate panes
+                (false, false, true, gdk::Key::Left) => {
+                    pane::navigate(&win, &nb, false);
+                    glib::Propagation::Stop
+                }
+                (false, false, true, gdk::Key::Right) => {
+                    pane::navigate(&win, &nb, true);
+                    glib::Propagation::Stop
+                }
+                // Next / prev tab
+                (true, false, false, gdk::Key::Tab) => {
+                    let n = nb.n_pages();
+                    if n > 1 {
+                        let next = (nb.current_page().unwrap_or(0) + 1) % n;
+                        nb.set_current_page(Some(next));
+                    }
+                    glib::Propagation::Stop
+                }
+                (true, true, false, gdk::Key::Tab | gdk::Key::ISO_Left_Tab) => {
+                    let n = nb.n_pages();
+                    if n > 1 {
+                        let cur = nb.current_page().unwrap_or(0);
+                        let prev = if cur == 0 { n - 1 } else { cur - 1 };
+                        nb.set_current_page(Some(prev));
+                    }
+                    glib::Propagation::Stop
+                }
+                // Toggle sidebar
+                (true, true, false, gdk::Key::b | gdk::Key::B) => {
+                    let visible = !sidebar_vis.get();
+                    sidebar_vis.set(visible);
+                    scroll.set_visible(visible);
+                    if visible {
+                        paned.set_position(220);
+                    }
+                    glib::Propagation::Stop
+                }
+                // Toggle browser panel
+                (true, true, false, gdk::Key::o | gdk::Key::O) => {
+                    let visible = !browser_vis.get();
+                    browser_vis.set(visible);
+                    browser_wgt.set_visible(visible);
+                    if visible {
+                        let total = cpaned.width();
+                        cpaned.set_position(if total > 0 { total / 2 } else { 600 });
+                        if browser_wv.uri().map(|u| u == "about:blank").unwrap_or(true) {
+                            // leave blank — user types their URL
+                        }
+                        browser_wgt.grab_focus();
+                    }
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+    }
+
+    window.add_controller(key_ctrl);
+
+    // Open file in editor tab when tree row is activated (M10)
+    {
+        let store = Rc::clone(&tree_store);
+        let nb_editor = notebook.clone();
+        let cfg_editor = Rc::clone(&cfg);
+        #[allow(deprecated)]
+        tree_view.connect_row_activated(move |_tv, path, _col| {
+            if let Some(iter) = filetree::iter_for_path(&store, path) {
+                let (file_path, is_dir) = filetree::row_info(&store, &iter);
+                if is_dir {
+                    if !filetree::has_children(&store, &iter) {
+                        filetree::populate_subtree(&store, &iter, &file_path);
+                    }
+                } else {
+                    editor::open(&file_path, &nb_editor, &cfg_editor);
+                }
+            }
+        });
+    }
+
+    // Dispatch IPC commands on the GTK main thread via an async task
+    {
+        let nb = notebook.clone();
+        let cfg = Rc::clone(&cfg);
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(req) = ipc_rx.recv().await {
+                let resp = match req.command {
+                    ipc::Command::Ping => ipc::Response {
+                        ok: true,
+                        error: None,
+                        accepted: None,
+                    },
+                    ipc::Command::NewTab => {
+                        add_tab(&nb, &cfg, None);
+                        ipc::Response {
+                            ok: true,
+                            error: None,
+                            accepted: None,
+                        }
+                    }
+                    ipc::Command::ShowDiff {
+                        path,
+                        old,
+                        new_content,
+                    } => {
+                        let (tx, rx) = async_channel::bounded::<bool>(1);
+                        diff::open(&path, &old, &new_content, &nb, tx);
+                        let accepted = rx.recv().await.unwrap_or(false);
+                        ipc::Response {
+                            ok: true,
+                            error: None,
+                            accepted: Some(accepted),
+                        }
+                    }
+                };
+                let _ = req.reply.send(resp);
+            }
+        });
+    }
+
+    window.present();
+}
+
+fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
+    let terminal = tab::build(cfg);
+    let page_idx = notebook.n_pages();
+
+    let label = gtk4::Label::new(Some("  ~  "));
+    notebook.append_page(&terminal, Some(&label));
+    notebook.set_current_page(Some(page_idx));
+    terminal.grab_focus();
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let pid_cell: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+    let pid_for_spawn = Rc::clone(&pid_cell);
+
+    terminal.spawn_async(
+        vte4::PtyFlags::DEFAULT,
+        cwd,
+        &[shell.as_str()],
+        &["PROMPT_SP=", "PROMPT_CR="],
+        glib::SpawnFlags::DEFAULT,
+        || {},
+        -1,
+        None::<&gio::Cancellable>,
+        move |result| {
+            if let Ok(pid) = result {
+                pid_for_spawn.set(pid.0);
+            }
+        },
+    );
+
+    // Notification ring: mark tab dirty when shell returns to prompt in a background tab.
+    // Requires shell integration to emit OSC 133;A (see shell-integration.zsh).
+    let dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    {
+        let dirty_c = Rc::clone(&dirty);
+        let nb_c = notebook.clone();
+        let term_c = terminal.clone();
+        terminal.connect_termprop_changed(Some("vte.shell.precmd"), move |_, _| {
+            if dirty_c.get() {
+                return;
+            }
+            let tw: gtk4::Widget = term_c.clone().upcast();
+            if let Some(page) = notebook_page_of(&tw, &nb_c) {
+                if nb_c.page_num(&page) != nb_c.current_page() {
+                    dirty_c.set(true);
+                }
+            }
+        });
+    }
+
+    // Poll cwd + git branch every second; show ring indicator when dirty
+    {
+        let label_ref = label.clone();
+        let pid_ref = Rc::clone(&pid_cell);
+        let dirty_ref = Rc::clone(&dirty);
+        let nb_ref = notebook.clone();
+        let term_ref = terminal.clone();
+        glib::timeout_add_seconds_local(1, move || {
+            let pid = pid_ref.get();
+            if pid <= 0 {
+                return glib::ControlFlow::Continue;
+            }
+            if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                return glib::ControlFlow::Break;
+            }
+
+            let tw: gtk4::Widget = term_ref.clone().upcast();
+            if let Some(page) = notebook_page_of(&tw, &nb_ref) {
+                if nb_ref.page_num(&page) == nb_ref.current_page() {
+                    dirty_ref.set(false);
+                }
+            }
+
+            let title = tab::tab_title(pid);
+            if dirty_ref.get() {
+                label_ref.set_markup(&format!(
+                    "<span foreground=\"#f38ba8\">●</span>{}",
+                    glib::markup_escape_text(title.trim_start()),
+                ));
+            } else {
+                label_ref.set_text(&title);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    let nb = notebook.clone();
+    let weak = terminal.downgrade();
+    terminal.connect_child_exited(move |_, _| {
+        if let Some(t) = weak.upgrade() {
+            pane::close_terminal(&t, &nb);
+        }
+    });
+}
+
+fn focused_terminal_cwd(window: &ApplicationWindow, notebook: &Notebook) -> Option<String> {
+    // Try focused terminal first
+    if let Some(term) =
+        gtk4::prelude::GtkWindowExt::focus(window).and_then(|w| w.downcast::<vte4::Terminal>().ok())
+    {
+        if let Some(cwd) = terminal_cwd(&term) {
+            return Some(cwd);
+        }
+    }
+
+    // Fall back to first terminal in current page
+    let page = notebook.nth_page(Some(notebook.current_page()?))?;
+    for term in pane::collect_terminals_pub(&page) {
+        if let Some(cwd) = terminal_cwd(&term) {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
+/// Get the cwd of the foreground process running in a terminal via the PTY.
+fn terminal_cwd(terminal: &vte4::Terminal) -> Option<String> {
+    use std::os::unix::io::AsRawFd;
+    let pty = terminal.pty()?;
+    let raw_fd = pty.fd().as_raw_fd();
+    let pgid = unsafe { libc::tcgetpgrp(raw_fd) };
+    if pgid <= 0 {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{}/cwd", pgid))
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Walk up the widget tree to find the notebook page that contains `widget`.
+fn notebook_page_of(widget: &gtk4::Widget, notebook: &Notebook) -> Option<gtk4::Widget> {
+    let mut w = widget.clone();
+    loop {
+        if notebook.page_num(&w).is_some() {
+            return Some(w);
+        }
+        w = w.parent()?;
+    }
+}
+
+fn build_css(cfg: &config::Config) -> String {
+    let font = &cfg.font.family;
+    let fsize = cfg.font.size;
+    let sidebar_pt = (fsize - 2).max(10);
+    format!(
+        "
+        window {{ background: transparent; }}
+
+        vte-terminal {{ padding: {p}px; }}
+
+        notebook header {{
+            background-color: #181825;
+            border-bottom: 1px solid #313244;
+            padding: 0;
+        }}
+        notebook header tab {{
+            color: #6c7086;
+            padding: 6px 16px;
+            border-radius: 0;
+            border: none;
+            box-shadow: none;
+        }}
+        notebook header tab:checked {{
+            color: #cdd6f4;
+            background-color: #1e1e2e;
+            border-bottom: 2px solid #cba6f7;
+        }}
+        notebook header tab:hover:not(:checked) {{
+            color: #bac2de;
+            background-color: #1e1e2e;
+        }}
+        notebook > stack {{ background-color: transparent; }}
+
+        .sidebar {{
+            background-color: #181825;
+            border-right: 1px solid #313244;
+        }}
+        .sidebar-header {{
+            background-color: #181825;
+            color: #a6adc8;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 10px 12px 6px 12px;
+            letter-spacing: 1px;
+        }}
+        .editor-view,
+        .editor-view text {{
+            font-family: {font};
+            font-size: {fsize}pt;
+            background-color: #1e1e2e;
+            color: #cdd6f4;
+        }}
+        .file-tree {{
+            background-color: #181825;
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+        .file-tree:selected {{
+            background-color: #313244;
+            color: #cdd6f4;
+        }}
+        .git-section-header {{
+            color: #6c7086;
+            font-size: 10px;
+            font-weight: bold;
+            letter-spacing: 1px;
+        }}
+
+        .browser-panel {{
+            background-color: #1e1e2e;
+            border-left: 1px solid #313244;
+        }}
+        .browser-nav {{
+            background-color: #181825;
+            border-bottom: 1px solid #313244;
+        }}
+        .browser-nav-btn {{
+            color: #cdd6f4;
+            background-color: #313244;
+            border: none;
+            border-radius: 4px;
+            padding: 2px 6px;
+            min-width: 0;
+            min-height: 0;
+        }}
+        .browser-nav-btn:hover {{
+            background-color: #45475a;
+        }}
+        .browser-nav entry {{
+            background-color: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 4px;
+            padding: 2px 8px;
+        }}
+        .browser-nav entry:focus {{
+            border-color: #cba6f7;
+        }}
+        ",
+        p = cfg.window.padding,
+    )
+}

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=sidekick
+Comment=Native Linux terminal workspace with file editing and git diffs
+Exec=sidekick
+Icon=sidekick
+Terminal=false
+Categories=Development;TerminalEmulator;
+StartupNotify=true
