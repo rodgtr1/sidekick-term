@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
+
+const MAX_IPC_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DIFF_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -40,9 +45,29 @@ pub fn socket_path() -> std::path::PathBuf {
 pub fn start() -> async_channel::Receiver<Request> {
     let path = socket_path();
 
-    let _ = std::fs::remove_file(&path);
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("sidekick: socket dir create failed: {e}");
+        }
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            eprintln!("sidekick: socket dir chmod failed: {e}");
+        }
+    }
+
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(_) => {
+            eprintln!(
+                "sidekick: refusing to remove non-socket path {}",
+                path.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("sidekick: socket metadata failed: {e}");
+        }
     }
 
     let (tx, rx) = async_channel::unbounded::<Request>();
@@ -55,11 +80,12 @@ pub fn start() -> async_channel::Receiver<Request> {
                 return;
             }
         };
-        for stream in listener.incoming() {
-            if let Ok(stream) = stream {
-                let tx = tx.clone();
-                std::thread::spawn(move || handle(stream, tx));
-            }
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("sidekick: socket chmod failed: {e}");
+        }
+        for stream in listener.incoming().flatten() {
+            let tx = tx.clone();
+            std::thread::spawn(move || handle(stream, tx));
         }
     });
 
@@ -68,12 +94,47 @@ pub fn start() -> async_channel::Receiver<Request> {
 
 fn handle(stream: std::os::unix::net::UnixStream, sender: async_channel::Sender<Request>) {
     let mut writer = stream.try_clone().expect("clone socket");
-    let reader = BufReader::new(stream);
+    if !peer_is_current_user(&stream) {
+        let resp = Response {
+            ok: false,
+            error: Some("peer uid does not match current user".to_string()),
+            accepted: None,
+        };
+        write_response(&mut writer, &resp);
+        return;
+    }
 
-    for line in reader.lines() {
-        let line = match line {
+    let mut reader = BufReader::new(stream);
+
+    loop {
+        let mut bytes = Vec::new();
+        let read = match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if read > MAX_IPC_LINE_BYTES || bytes.len() > MAX_IPC_LINE_BYTES {
+            let resp = Response {
+                ok: false,
+                error: Some("IPC request is too large".to_string()),
+                accepted: None,
+            };
+            write_response(&mut writer, &resp);
+            break;
+        }
+
+        let line = match String::from_utf8(bytes) {
             Ok(l) if !l.trim().is_empty() => l,
-            _ => break,
+            Ok(_) => continue,
+            Err(e) => {
+                let resp = Response {
+                    ok: false,
+                    error: Some(e.to_string()),
+                    accepted: None,
+                };
+                write_response(&mut writer, &resp);
+                continue;
+            }
         };
 
         let command: Command = match serde_json::from_str(&line) {
@@ -84,10 +145,19 @@ fn handle(stream: std::os::unix::net::UnixStream, sender: async_channel::Sender<
                     error: Some(e.to_string()),
                     accepted: None,
                 };
-                let _ = writeln!(writer, "{}", serde_json::to_string(&r).unwrap());
+                write_response(&mut writer, &r);
                 continue;
             }
         };
+        if let Err(error) = validate_command(&command) {
+            let resp = Response {
+                ok: false,
+                error: Some(error),
+                accepted: None,
+            };
+            write_response(&mut writer, &resp);
+            continue;
+        }
 
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
         if sender
@@ -102,9 +172,55 @@ fn handle(stream: std::os::unix::net::UnixStream, sender: async_channel::Sender<
 
         match reply_rx.recv() {
             Ok(resp) => {
-                let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
+                write_response(&mut writer, &resp);
             }
             Err(_) => break,
         }
     }
+}
+
+fn validate_command(command: &Command) -> Result<(), String> {
+    match command {
+        Command::ShowDiff {
+            old, new_content, ..
+        } => {
+            if old.len() > MAX_DIFF_CONTENT_BYTES || new_content.len() > MAX_DIFF_CONTENT_BYTES {
+                Err("diff content is too large".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn write_response(writer: &mut std::os::unix::net::UnixStream, resp: &Response) {
+    if let Ok(json) = serde_json::to_string(resp) {
+        let _ = writeln!(writer, "{json}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_is_current_user(stream: &std::os::unix::net::UnixStream) -> bool {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    rc == 0 && cred.uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_is_current_user(_stream: &std::os::unix::net::UnixStream) -> bool {
+    true
 }

@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub theme: ThemeConfig,
@@ -50,18 +50,6 @@ pub struct BehaviorConfig {
     pub allow_hyperlinks: bool,
     pub mouse_autohide: bool,
     pub audible_bell: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            theme: ThemeConfig::default(),
-            font: FontConfig::default(),
-            cursor: CursorConfig::default(),
-            window: WindowConfig::default(),
-            behavior: BehaviorConfig::default(),
-        }
-    }
 }
 
 impl Default for ThemeConfig {

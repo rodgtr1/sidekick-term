@@ -6,6 +6,8 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+const MAX_HOOK_TEXT_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct HookInput {
     tool_name: String,
@@ -65,7 +67,11 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
             if path.is_empty() {
                 return vec![];
             }
-            let old = std::fs::read_to_string(&path).unwrap_or_default();
+            if new.len() > MAX_HOOK_TEXT_BYTES as usize {
+                eprintln!("sidekick-hook: edit too large to preview");
+                std::process::exit(2);
+            }
+            let old = read_existing_text_limited(&path).unwrap_or_default();
             vec![(path, old, new)]
         }
         "Edit" => {
@@ -75,8 +81,15 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
             if path.is_empty() {
                 return vec![];
             }
-            let file_content = std::fs::read_to_string(&path).unwrap_or_default();
+            let file_content = match read_existing_text_limited(&path) {
+                Some(content) => content,
+                None => return vec![],
+            };
             let new_content = file_content.replacen(&old_str, &new_str, 1);
+            if new_content.len() > MAX_HOOK_TEXT_BYTES as usize {
+                eprintln!("sidekick-hook: edit too large to preview");
+                std::process::exit(2);
+            }
             vec![(path, file_content, new_content)]
         }
         "MultiEdit" => {
@@ -84,13 +97,20 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
             if path.is_empty() {
                 return vec![];
             }
-            let mut current = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut current = match read_existing_text_limited(&path) {
+                Some(content) => content,
+                None => return vec![],
+            };
             let original = current.clone();
             if let Some(edits) = input.tool_input["edits"].as_array() {
                 for edit in edits {
                     let old_str = edit["old_string"].as_str().unwrap_or("").to_string();
                     let new_str = edit["new_string"].as_str().unwrap_or("").to_string();
                     current = current.replacen(&old_str, &new_str, 1);
+                    if current.len() > MAX_HOOK_TEXT_BYTES as usize {
+                        eprintln!("sidekick-hook: edit too large to preview");
+                        std::process::exit(2);
+                    }
                 }
             }
             vec![(path, original, current)]
@@ -101,6 +121,18 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
 
 fn str_field(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or("").to_string()
+}
+
+fn read_existing_text_limited(path: &str) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_HOOK_TEXT_BYTES {
+        return None;
+    }
+    let content = std::fs::read(path).ok()?;
+    if content.iter().take(8192).any(|b| *b == 0) {
+        return None;
+    }
+    String::from_utf8(content).ok()
 }
 
 fn show_diff(path: &str, old: &str, new_content: &str) -> Option<bool> {

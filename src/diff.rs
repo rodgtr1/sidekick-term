@@ -1,6 +1,28 @@
 use gtk4::prelude::*;
 use similar::{ChangeTag, TextDiff};
 
+pub fn open_message(title: &str, path: &str, message: &str, notebook: &gtk4::Notebook) {
+    let buffer = gtk4::TextBuffer::new(None::<&gtk4::TextTagTable>);
+    buffer.set_text(&format!("{path}\n\n{message}"));
+
+    let view = gtk4::TextView::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_monospace(true);
+    view.add_css_class("editor-view");
+
+    let scroll = gtk4::ScrolledWindow::new();
+    scroll.set_child(Some(&view));
+    scroll.set_vexpand(true);
+    scroll.set_hexpand(true);
+
+    let tab_label = gtk4::Label::new(Some(title));
+    let page_idx = notebook.n_pages();
+    notebook.append_page(&scroll, Some(&tab_label));
+    notebook.set_current_page(Some(page_idx));
+    view.grab_focus();
+}
+
 pub fn open(
     path: &str,
     old: &str,
@@ -8,6 +30,19 @@ pub fn open(
     notebook: &gtk4::Notebook,
     decision: async_channel::Sender<bool>,
 ) {
+    if old.len() > crate::limits::MAX_DIFF_BYTES
+        || new_content.len() > crate::limits::MAX_DIFF_BYTES
+    {
+        open_message(
+            "diff too large",
+            path,
+            "Diff content is too large to preview safely.",
+            notebook,
+        );
+        let _ = decision.send_blocking(false);
+        return;
+    }
+
     let filename = std::path::Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -185,6 +220,15 @@ pub fn open(
 
 pub fn open_readonly(title: &str, diff_text: &str, notebook: &gtk4::Notebook) {
     if diff_text.trim().is_empty() {
+        return;
+    }
+    if diff_text.len() > crate::limits::MAX_DIFF_BYTES {
+        open_message(
+            "diff too large",
+            title,
+            "Diff content is too large to preview safely.",
+            notebook,
+        );
         return;
     }
 

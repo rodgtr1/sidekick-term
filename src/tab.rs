@@ -1,6 +1,14 @@
 use crate::config::Config;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use vte4::prelude::*;
 use vte4::Terminal;
+
+type BranchCache = HashMap<String, (Instant, Option<String>)>;
+
+static BRANCH_CACHE: OnceLock<Mutex<BranchCache>> = OnceLock::new();
+const BRANCH_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Creates and configures a terminal widget. Does not spawn the shell —
 /// caller is responsible for spawning so it can capture the child PID.
@@ -44,19 +52,7 @@ pub fn tab_title(pid: i32) -> String {
         Err(_) => return "~".to_string(),
     };
 
-    let branch = std::process::Command::new("git")
-        .args([
-            "-C",
-            cwd.to_str().unwrap_or("."),
-            "branch",
-            "--show-current",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let branch = branch_for_cwd(cwd.to_str().unwrap_or("."));
 
     let cwd_str = cwd.to_string_lossy();
     let short = if cwd_str == home {
@@ -71,4 +67,30 @@ pub fn tab_title(pid: i32) -> String {
         Some(b) => format!("  {} [{}]  ", short, b),
         None => format!("  {}  ", short),
     }
+}
+
+fn branch_for_cwd(cwd: &str) -> Option<String> {
+    let cache = BRANCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    if let Ok(cache) = cache.lock() {
+        if let Some((checked_at, branch)) = cache.get(cwd) {
+            if now.duration_since(*checked_at) < BRANCH_CACHE_TTL {
+                return branch.clone();
+            }
+        }
+    }
+
+    let branch = std::process::Command::new("git")
+        .args(["-C", cwd, "branch", "--show-current"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(cwd.to_string(), (now, branch.clone()));
+    }
+    branch
 }

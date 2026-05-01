@@ -6,6 +6,7 @@ mod filetree;
 mod git;
 mod gitpanel;
 mod ipc;
+mod limits;
 mod pane;
 mod tab;
 mod theme;
@@ -14,10 +15,30 @@ use gtk4::prelude::*;
 use gtk4::{gdk, Application, ApplicationWindow, Notebook};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc;
 use vte4::prelude::*;
 use webkit6::prelude::WebViewExt as _;
 
 const APP_ID: &str = "com.travismedia.sidekick";
+
+enum UiResult {
+    Tree {
+        cwd: String,
+        entries: Vec<filetree::TreeEntry>,
+    },
+    Subtree {
+        path: String,
+        entries: Vec<filetree::TreeEntry>,
+    },
+    Git {
+        cwd: String,
+        files: Vec<git::GitFile>,
+    },
+    Diff {
+        title: String,
+        result: Result<String, String>,
+    },
+}
 
 fn main() -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
@@ -107,42 +128,112 @@ fn build_ui(app: &Application) {
 
     // Track last known cwd to avoid redundant tree reloads
     let last_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let (ui_tx, ui_rx) = mpsc::channel::<UiResult>();
+    let ui_rx = Rc::new(RefCell::new(ui_rx));
+    let tree_busy = Rc::new(Cell::new(false));
+    let git_busy = Rc::new(Cell::new(false));
 
-    // Poll active terminal's cwd; refresh file tree and git panel when it changes
+    // Apply filesystem/git work that completed off the GTK thread.
     {
-        let nb = notebook.clone();
+        let rx = Rc::clone(&ui_rx);
         let store = Rc::clone(&tree_store);
         let last = Rc::clone(&last_cwd);
-        let win = window.clone();
-        let header = tree_header.clone();
         let git_list_c = git_list.clone();
         let git_hdr_c = git_list_header.clone();
         let git_files_c = Rc::clone(&git_files);
+        let tree_busy_c = Rc::clone(&tree_busy);
+        let git_busy_c = Rc::clone(&git_busy);
+        let nb_c = notebook.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            while let Ok(result) = rx.borrow_mut().try_recv() {
+                match result {
+                    UiResult::Tree { cwd, entries } => {
+                        tree_busy_c.set(false);
+                        if *last.borrow() == cwd {
+                            filetree::apply_root(&store, &entries);
+                        }
+                    }
+                    UiResult::Subtree { path, entries } => {
+                        if let Some(iter) = filetree::find_iter_by_file_path(&store, &path) {
+                            filetree::apply_subtree(&store, &iter, &entries);
+                        }
+                    }
+                    UiResult::Git { cwd, files } => {
+                        git_busy_c.set(false);
+                        if *last.borrow() == cwd {
+                            let count = files.len();
+                            git_hdr_c.set_text(
+                                if count > 0 {
+                                    format!("GIT CHANGES ({})", count)
+                                } else {
+                                    "GIT CHANGES".to_string()
+                                }
+                                .as_str(),
+                            );
+                            gitpanel::populate(&git_list_c, &files);
+                            *git_files_c.borrow_mut() = files;
+                        }
+                    }
+                    UiResult::Diff { title, result } => match result {
+                        Ok(diff_text) => diff::open_readonly(&title, &diff_text, &nb_c),
+                        Err(message) => {
+                            diff::open_message("diff unavailable", &title, &message, &nb_c)
+                        }
+                    },
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // Poll active terminal's cwd; refresh file tree when it changes.
+    {
+        let nb = notebook.clone();
+        let last = Rc::clone(&last_cwd);
+        let win = window.clone();
+        let header = tree_header.clone();
+        let tx = ui_tx.clone();
+        let tree_busy_c = Rc::clone(&tree_busy);
         glib::timeout_add_seconds_local(1, move || {
             if let Some(cwd) = focused_terminal_cwd(&win, &nb) {
                 let mut prev = last.borrow_mut();
                 if *prev != cwd {
                     *prev = cwd.clone();
-                    filetree::populate(&store, &cwd);
                     let name = std::path::Path::new(&cwd)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| cwd.clone());
                     header.set_text(&name);
+                    tree_busy_c.set(true);
+                    let tx = tx.clone();
+                    let cwd_for_thread = cwd.clone();
+                    std::thread::spawn(move || {
+                        let entries = filetree::scan_root(&cwd_for_thread);
+                        let _ = tx.send(UiResult::Tree {
+                            cwd: cwd_for_thread,
+                            entries,
+                        });
+                    });
                 }
-                // Refresh git panel on every tick (fast for local repos)
-                let files = git::changed_files(&cwd);
-                let count = files.len();
-                git_hdr_c.set_text(
-                    if count > 0 {
-                        format!("GIT CHANGES ({})", count)
-                    } else {
-                        "GIT CHANGES".to_string()
-                    }
-                    .as_str(),
-                );
-                gitpanel::populate(&git_list_c, &files);
-                *git_files_c.borrow_mut() = files;
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // Refresh git status off the GTK thread on a slower cadence.
+    {
+        let last = Rc::clone(&last_cwd);
+        let tx = ui_tx.clone();
+        let git_busy_c = Rc::clone(&git_busy);
+        glib::timeout_add_seconds_local(5, move || {
+            let cwd = last.borrow().clone();
+            if !cwd.is_empty() && !git_busy_c.get() {
+                git_busy_c.set(true);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let files = git::changed_files(&cwd);
+                    let _ = tx.send(UiResult::Git { cwd, files });
+                });
             }
             glib::ControlFlow::Continue
         });
@@ -151,8 +242,8 @@ fn build_ui(app: &Application) {
     // Open diff tab when a changed file is clicked in the git panel
     {
         let files_ref = Rc::clone(&git_files);
-        let nb_c = notebook.clone();
         let last_cwd_c = Rc::clone(&last_cwd);
+        let tx = ui_tx.clone();
         git_list.connect_row_activated(move |_, row| {
             let name = row.widget_name().to_string();
             let (staged, rel_path) = if let Some(r) = name.strip_prefix("s:") {
@@ -168,10 +259,15 @@ fn build_ui(app: &Application) {
                 .find(|f| f.rel_path == rel_path && f.staged == staged)
             {
                 let cwd = last_cwd_c.borrow().clone();
-                if let Some(root) = git::repo_root(&cwd) {
-                    let diff_text = git::file_diff(&root, file);
-                    diff::open_readonly(&file.rel_path, &diff_text, &nb_c);
-                }
+                let file = file.clone();
+                let title = file.rel_path.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let result = git::repo_root(&cwd)
+                        .ok_or_else(|| "Not inside a git repository.".to_string())
+                        .and_then(|root| git::file_diff(&root, &file));
+                    let _ = tx.send(UiResult::Diff { title, result });
+                });
             }
         });
     }
@@ -293,13 +389,21 @@ fn build_ui(app: &Application) {
         let store = Rc::clone(&tree_store);
         let nb_editor = notebook.clone();
         let cfg_editor = Rc::clone(&cfg);
+        let tx = ui_tx.clone();
         #[allow(deprecated)]
         tree_view.connect_row_activated(move |_tv, path, _col| {
             if let Some(iter) = filetree::iter_for_path(&store, path) {
                 let (file_path, is_dir) = filetree::row_info(&store, &iter);
                 if is_dir {
                     if !filetree::has_children(&store, &iter) {
-                        filetree::populate_subtree(&store, &iter, &file_path);
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            let entries = filetree::scan_subtree(&file_path);
+                            let _ = tx.send(UiResult::Subtree {
+                                path: file_path,
+                                entries,
+                            });
+                        });
                     }
                 } else {
                     editor::open(&file_path, &nb_editor, &cfg_editor);

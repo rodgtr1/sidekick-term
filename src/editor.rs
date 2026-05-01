@@ -4,18 +4,16 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 pub fn open(path: &str, notebook: &gtk4::Notebook, _cfg: &crate::config::Config) {
-    let filename = std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+    let filename = crate::limits::display_name(path);
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("sidekick: cannot open {path}: {e}");
-            return;
-        }
-    };
+    let content =
+        match crate::limits::read_text_file_limited(path, crate::limits::MAX_EDITOR_FILE_BYTES) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::diff::open_message(&filename, path, &e, notebook);
+                return;
+            }
+        };
 
     // Language detection from file extension / content
     let lm = sourceview5::LanguageManager::default();

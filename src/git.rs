@@ -1,4 +1,8 @@
+use std::io::Read;
 use std::process::Command;
+use std::process::Stdio;
+
+const MAX_GIT_STATUS_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GitStatus {
@@ -54,16 +58,14 @@ pub fn changed_files(cwd: &str) -> Vec<GitFile> {
         Some(r) => r,
         None => return vec![],
     };
-    let out = Command::new("git")
-        .args(["-C", &root, "status", "--porcelain=v1", "-u"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success());
-    let out = match out {
-        Some(o) => o,
-        None => return vec![],
+    let out = match command_stdout_limited(
+        Command::new("git").args(["-C", &root, "status", "--porcelain=v1", "-u"]),
+        MAX_GIT_STATUS_BYTES,
+    ) {
+        Ok(out) => out,
+        Err(_) => return vec![],
     };
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = String::from_utf8_lossy(&out);
     let mut files = Vec::new();
     for line in text.lines() {
         if line.len() < 4 {
@@ -124,9 +126,12 @@ pub fn changed_files(cwd: &str) -> Vec<GitFile> {
     files
 }
 
-pub fn file_diff(root: &str, file: &GitFile) -> String {
+pub fn file_diff(root: &str, file: &GitFile) -> Result<String, String> {
     if file.status == GitStatus::Untracked {
-        let content = std::fs::read_to_string(&file.abs_path).unwrap_or_default();
+        let content = crate::limits::read_text_file_limited(
+            &file.abs_path,
+            crate::limits::MAX_DIFF_BYTES as u64,
+        )?;
         let mut diff = format!(
             "--- /dev/null\n+++ b/{}\n@@ -0,0 +1,{} @@\n",
             file.rel_path,
@@ -136,8 +141,11 @@ pub fn file_diff(root: &str, file: &GitFile) -> String {
             diff.push('+');
             diff.push_str(line);
             diff.push('\n');
+            if diff.len() > crate::limits::MAX_DIFF_BYTES {
+                return Err("Diff is too large to preview safely.".to_string());
+            }
         }
-        return diff;
+        return Ok(diff);
     }
     // Staged: diff between HEAD and index. Unstaged: diff between index and working tree.
     let args: Vec<&str> = if file.staged {
@@ -145,11 +153,44 @@ pub fn file_diff(root: &str, file: &GitFile) -> String {
     } else {
         vec!["-C", root, "diff", "--", &file.rel_path]
     };
-    Command::new("git")
-        .args(&args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default()
+    let bytes = command_stdout_limited(
+        Command::new("git").args(&args),
+        crate::limits::MAX_DIFF_BYTES,
+    )?;
+    String::from_utf8(bytes).map_err(|_| "Diff is not valid UTF-8 text.".to_string())
+}
+
+fn command_stdout_limited(command: &mut Command, limit: usize) -> Result<Vec<u8>, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not capture command output.".to_string())?;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let read = stdout.read(&mut buf).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buf[..read]);
+        if output.len() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Command output is too large.".to_string());
+        }
+    }
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(output)
+    } else {
+        Err(format!("Command exited with {status}."))
+    }
 }
