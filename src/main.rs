@@ -138,6 +138,7 @@ fn build_ui(app: &Application) {
     {
         let rx = Rc::clone(&ui_rx);
         let store = Rc::clone(&tree_store);
+        let tv = tree_view.clone();
         let last = Rc::clone(&last_cwd);
         let header_c = tree_header.clone();
         let git_list_c = git_list.clone();
@@ -157,7 +158,7 @@ fn build_ui(app: &Application) {
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| tree_root.clone());
                             header_c.set_text(&name);
-                            filetree::apply_root(&store, &entries);
+                            filetree::apply_root(&store, &tv, &entries);
                         }
                     }
                     UiResult::Subtree { path, entries } => {
@@ -393,25 +394,30 @@ fn build_ui(app: &Application) {
         let store = Rc::clone(&tree_store);
         let nb_editor = notebook.clone();
         let cfg_editor = Rc::clone(&cfg);
-        let tx = ui_tx.clone();
         #[allow(deprecated)]
         tree_view.connect_row_activated(move |_tv, path, _col| {
             if let Some(iter) = filetree::iter_for_path(&store, path) {
                 let (file_path, is_dir) = filetree::row_info(&store, &iter);
-                if is_dir {
-                    if !filetree::has_children(&store, &iter) {
-                        let tx = tx.clone();
-                        std::thread::spawn(move || {
-                            let entries = filetree::scan_subtree(&file_path);
-                            let _ = tx.send(UiResult::Subtree {
-                                path: file_path,
-                                entries,
-                            });
-                        });
-                    }
-                } else {
+                if !is_dir {
                     editor::open(&file_path, &nb_editor, &cfg_editor);
                 }
+            }
+        });
+    }
+
+    // Lazy-load directory children when a row with a placeholder is expanded
+    {
+        let store = Rc::clone(&tree_store);
+        let tx = ui_tx.clone();
+        #[allow(deprecated)]
+        tree_view.connect_row_expanded(move |_tv, iter, _path| {
+            if filetree::has_placeholder(&store, iter) {
+                let (file_path, _) = filetree::row_info(&store, iter);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let entries = filetree::scan_subtree(&file_path);
+                    let _ = tx.send(UiResult::Subtree { path: file_path, entries });
+                });
             }
         });
     }

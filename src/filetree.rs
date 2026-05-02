@@ -8,7 +8,8 @@ pub const COL_NAME: u32 = 0;
 pub const COL_PATH: u32 = 1;
 pub const COL_IS_DIR: u32 = 2;
 pub const COL_IGNORED: u32 = 3;
-pub const MAX_DEPTH: u32 = 1;
+const MAX_DEPTH: u32 = 2;
+const PLACEHOLDER_PATH: &str = "//placeholder//";
 
 #[derive(Clone, Debug)]
 pub struct TreeEntry {
@@ -45,7 +46,6 @@ pub fn build() -> (
     let icon_cell = gtk4::CellRendererPixbuf::new();
     let text_cell = gtk4::CellRendererText::new();
 
-    // Eliminate cell renderer padding so rows are compact
     icon_cell.set_property("ypad", 1u32);
     icon_cell.set_property("xpad", 2u32);
     text_cell.set_property("ypad", 1u32);
@@ -64,18 +64,32 @@ pub fn build() -> (
          cell: &gtk4::CellRenderer,
          model: &gtk4::TreeModel,
          iter: &gtk4::TreeIter| {
+            let path = model
+                .get_value(iter, COL_PATH as i32)
+                .get::<String>()
+                .unwrap_or_default();
+            if path == PLACEHOLDER_PATH {
+                cell.set_property("gicon", &gio::ThemedIcon::new("text-x-generic"));
+                return;
+            }
             let is_dir = model
                 .get_value(iter, COL_IS_DIR as i32)
                 .get::<bool>()
                 .unwrap_or(false);
-            cell.set_property(
-                "icon-name",
-                if is_dir {
-                    "folder-symbolic"
-                } else {
-                    "text-x-generic-symbolic"
-                },
-            );
+            let name = model
+                .get_value(iter, COL_NAME as i32)
+                .get::<String>()
+                .unwrap_or_default();
+            let content_type = if is_dir {
+                "inode/directory".to_string()
+            } else {
+                gio::content_type_guess(Some(name.as_str()), None::<&[u8]>)
+                    .0
+                    .to_string()
+            };
+            let icon = gio::content_type_get_icon(&content_type);
+            cell.set_property("icon-name", "");
+            cell.set_property("gicon", &icon);
         },
     );
 
@@ -85,6 +99,15 @@ pub fn build() -> (
          cell: &gtk4::CellRenderer,
          model: &gtk4::TreeModel,
          iter: &gtk4::TreeIter| {
+            let path = model
+                .get_value(iter, COL_PATH as i32)
+                .get::<String>()
+                .unwrap_or_default();
+            if path == PLACEHOLDER_PATH {
+                cell.set_property("text", "");
+                cell.set_property("foreground", "#45475a");
+                return;
+            }
             let name = model
                 .get_value(iter, COL_NAME as i32)
                 .get::<String>()
@@ -109,7 +132,6 @@ pub fn build() -> (
     scroll.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
     scroll.set_vexpand(true);
 
-    // Header label showing current folder name
     let header = gtk4::Label::new(Some("~"));
     header.set_xalign(0.0);
     header.add_css_class("sidebar-header");
@@ -125,15 +147,28 @@ pub fn scan_root(root: &str) -> Vec<TreeEntry> {
 pub fn scan_subtree(path: &str) -> Vec<TreeEntry> {
     let root = crate::git::repo_root(path).unwrap_or_else(|| path.to_string());
     let ignored = crate::git::ignored_set(&root);
-    scan_dir(path, 1, &ignored)
+    scan_dir(path, 0, &ignored)
 }
 
-pub fn apply_root(store: &gtk4::TreeStore, entries: &[TreeEntry]) {
+/// Bulk-load entries into the store. Detaches the view during population so
+/// GTK reads the complete model state on reconnect instead of processing
+/// O(n²) incremental signals.
+pub fn apply_root(
+    store: &gtk4::TreeStore,
+    tree_view: &gtk4::TreeView,
+    entries: &[TreeEntry],
+) {
+    tree_view.set_model(None::<&gtk4::TreeStore>);
     store.clear();
     apply_entries(store, None, entries);
+    tree_view.set_model(Some(store));
 }
 
-pub fn apply_subtree(store: &gtk4::TreeStore, parent: &gtk4::TreeIter, entries: &[TreeEntry]) {
+pub fn apply_subtree(
+    store: &gtk4::TreeStore,
+    parent: &gtk4::TreeIter,
+    entries: &[TreeEntry],
+) {
     clear_children(store, parent);
     apply_entries(store, Some(parent), entries);
 }
@@ -154,13 +189,23 @@ pub fn iter_for_path(store: &gtk4::TreeStore, path: &gtk4::TreePath) -> Option<g
     store.iter(path)
 }
 
-pub fn find_iter_by_file_path(store: &gtk4::TreeStore, file_path: &str) -> Option<gtk4::TreeIter> {
+pub fn find_iter_by_file_path(
+    store: &gtk4::TreeStore,
+    file_path: &str,
+) -> Option<gtk4::TreeIter> {
     let iter = store.iter_first()?;
     find_iter_recursive(store, &iter, file_path)
 }
 
-pub fn has_children(store: &gtk4::TreeStore, iter: &gtk4::TreeIter) -> bool {
-    store.iter_children(Some(iter)).is_some()
+pub fn has_placeholder(store: &gtk4::TreeStore, iter: &gtk4::TreeIter) -> bool {
+    match store.iter_children(Some(iter)) {
+        None => false,
+        Some(child) => store
+            .get_value(&child, COL_PATH as i32)
+            .get::<String>()
+            .map(|p| p == PLACEHOLDER_PATH)
+            .unwrap_or(false),
+    }
 }
 
 fn find_iter_recursive(
@@ -175,7 +220,6 @@ fn find_iter_recursive(
     if current == file_path {
         return Some(*iter);
     }
-
     if let Some(mut child) = store.iter_children(Some(iter)) {
         loop {
             if let Some(found) = find_iter_recursive(store, &child, file_path) {
@@ -186,7 +230,6 @@ fn find_iter_recursive(
             }
         }
     }
-
     None
 }
 
@@ -226,10 +269,27 @@ fn scan_dir(
 
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
 
-    if depth < MAX_DEPTH {
-        for entry in &mut entries {
-            if entry.is_dir {
-                entry.children = scan_dir(&entry.path, depth + 1, ignored);
+    for entry in &mut entries {
+        if !entry.is_dir || entry.ignored {
+            continue;
+        }
+        if depth < MAX_DEPTH {
+            entry.children = scan_dir(&entry.path, depth + 1, ignored);
+        } else {
+            // At max depth: peek to see if this dir has any content so we can
+            // show an expand arrow. One read_dir call, no recursion.
+            let has_content = std::fs::read_dir(&entry.path)
+                .ok()
+                .and_then(|mut d| d.next())
+                .is_some();
+            if has_content {
+                entry.children = vec![TreeEntry {
+                    name: String::new(),
+                    path: PLACEHOLDER_PATH.to_string(),
+                    is_dir: false,
+                    ignored: false,
+                    children: vec![],
+                }];
             }
         }
     }
@@ -237,7 +297,11 @@ fn scan_dir(
     entries
 }
 
-fn apply_entries(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, entries: &[TreeEntry]) {
+fn apply_entries(
+    store: &gtk4::TreeStore,
+    parent: Option<&gtk4::TreeIter>,
+    entries: &[TreeEntry],
+) {
     for entry in entries {
         let iter = store.append(parent);
         store.set_value(&iter, COL_NAME, &entry.name.to_value());

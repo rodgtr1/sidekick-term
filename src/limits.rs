@@ -3,7 +3,7 @@ use std::path::Path;
 
 pub const MAX_EDITOR_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_DIFF_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_DIRECTORY_ENTRIES: usize = 5_000;
+pub const MAX_DIRECTORY_ENTRIES: usize = 500;
 
 pub fn read_text_file_limited(path: &str, max_bytes: u64) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("Cannot inspect file: {e}"))?;
