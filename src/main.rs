@@ -462,7 +462,11 @@ fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
     let label = gtk4::Label::new(Some("  ~  "));
     notebook.append_page(&terminal, Some(&label));
     notebook.set_current_page(Some(page_idx));
-    terminal.grab_focus();
+    let t = terminal.clone();
+    glib::idle_add_local(move || {
+        t.grab_focus();
+        glib::ControlFlow::Break
+    });
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let pid_cell: Rc<Cell<i32>> = Rc::new(Cell::new(0));
