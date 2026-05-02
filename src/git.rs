@@ -188,6 +188,38 @@ pub fn file_diff(root: &str, file: &GitFile) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "Diff is not valid UTF-8 text.".to_string())
 }
 
+pub fn ahead_count(cwd: &str) -> u32 {
+    let root = match repo_root(cwd) {
+        Some(r) => r,
+        None => return 0,
+    };
+    let out = Command::new("git")
+        .args(["-C", &root, "rev-list", "--count", "@{u}..HEAD"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+pub fn push(cwd: &str) -> Result<(), String> {
+    let root = repo_root(cwd).ok_or_else(|| "Not a git repository.".to_string())?;
+    let out = Command::new("git")
+        .args(["-C", &root, "push"])
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 fn command_stdout_limited(command: &mut Command, limit: usize) -> Result<Vec<u8>, String> {
     let mut child = command
         .stdout(Stdio::piped())

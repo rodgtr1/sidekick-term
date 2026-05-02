@@ -34,10 +34,14 @@ enum UiResult {
     Git {
         cwd: String,
         files: Vec<git::GitFile>,
+        ahead: u32,
     },
     Diff {
         title: String,
         result: Result<String, String>,
+    },
+    Push {
+        result: Result<(), String>,
     },
 }
 
@@ -61,25 +65,48 @@ fn build_ui(app: &Application) {
     let tree_store = Rc::new(tree_store);
 
     // Git panel
-    let (git_panel, git_list_header, git_list) = gitpanel::build();
+    let (git_panel, git_list_header, git_list, push_btn) = gitpanel::build();
     let git_files: Rc<RefCell<Vec<git::GitFile>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // Vertical paned inside sidebar: file tree (top) | git changes (bottom)
-    let sidebar_paned = gtk4::Paned::new(gtk4::Orientation::Vertical);
-    sidebar_paned.set_start_child(Some(&tree_scroll));
-    sidebar_paned.set_end_child(Some(&git_panel));
-    sidebar_paned.set_shrink_start_child(false);
-    sidebar_paned.set_shrink_end_child(false);
-    sidebar_paned.set_resize_start_child(true);
-    sidebar_paned.set_resize_end_child(false);
-    sidebar_paned.set_position(360);
+    // File tree page (header + scroll stacked vertically)
+    let files_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    files_page.append(&tree_header);
+    files_page.append(&tree_scroll);
 
-    // Sidebar container
-    let tree_sidebar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    tree_sidebar.set_width_request(260);
+    // Panel stack switches between file tree and git panel
+    let panel_stack = gtk4::Stack::new();
+    panel_stack.set_transition_type(gtk4::StackTransitionType::None);
+    panel_stack.set_hexpand(true);
+    panel_stack.add_named(&files_page, Some("files"));
+    panel_stack.add_named(&git_panel, Some("git"));
+
+    // Activity bar: narrow icon strip on the far left
+    let activity_bar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    activity_bar.add_css_class("activity-bar");
+    activity_bar.set_width_request(40);
+
+    let btn_files = gtk4::Button::new();
+    btn_files.add_css_class("activity-btn");
+    btn_files.add_css_class("active");
+    let img_files = gtk4::Image::from_icon_name("folder-symbolic");
+    img_files.set_pixel_size(20);
+    btn_files.set_child(Some(&img_files));
+    btn_files.set_tooltip_text(Some("Explorer"));
+
+    let btn_git = gtk4::Button::new();
+    btn_git.add_css_class("activity-btn");
+    let img_git = gtk4::Image::from_icon_name("emblem-synchronizing-symbolic");
+    img_git.set_pixel_size(20);
+    btn_git.set_child(Some(&img_git));
+    btn_git.set_tooltip_text(Some("Source Control"));
+
+    activity_bar.append(&btn_files);
+    activity_bar.append(&btn_git);
+
+    // Panel stack is the togglable sidebar content (no activity bar inside)
+    let tree_sidebar = panel_stack.clone();
+    tree_sidebar.set_width_request(220);
     tree_sidebar.add_css_class("sidebar");
-    tree_sidebar.append(&tree_header);
-    tree_sidebar.append(&sidebar_paned);
 
     // Browser panel (hidden by default)
     let browser_panel = browser::build();
@@ -95,7 +122,7 @@ fn build_ui(app: &Application) {
     content_paned.set_resize_start_child(true);
     content_paned.set_resize_end_child(true);
 
-    // Root paned: sidebar | content_paned
+    // Root paned: panel stack | content_paned
     let root_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
     root_paned.set_start_child(Some(&tree_sidebar));
     root_paned.set_end_child(Some(&content_paned));
@@ -103,7 +130,12 @@ fn build_ui(app: &Application) {
     root_paned.set_shrink_end_child(false);
     root_paned.set_resize_start_child(false);
     root_paned.set_resize_end_child(true);
-    root_paned.set_position(260);
+    root_paned.set_position(220);
+
+    // Root layout: activity bar (always visible) | root paned
+    let root_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    root_box.append(&activity_bar);
+    root_box.append(&root_paned);
 
     // Sidebar visible by default
     let sidebar_visible: Rc<Cell<bool>> = Rc::new(Cell::new(true));
@@ -124,7 +156,7 @@ fn build_ui(app: &Application) {
         .title("sidekick")
         .default_width(1400)
         .default_height(800)
-        .child(&root_paned)
+        .child(&root_box)
         .build();
 
     // Track last known cwd to avoid redundant tree reloads
@@ -147,6 +179,8 @@ fn build_ui(app: &Application) {
         let tree_busy_c = Rc::clone(&tree_busy);
         let git_busy_c = Rc::clone(&git_busy);
         let nb_c = notebook.clone();
+        let push_btn_c = push_btn.clone();
+        let win_c = window.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             while let Ok(result) = rx.borrow_mut().try_recv() {
                 match result {
@@ -166,7 +200,7 @@ fn build_ui(app: &Application) {
                             filetree::apply_subtree(&store, &iter, &entries);
                         }
                     }
-                    UiResult::Git { cwd, files } => {
+                    UiResult::Git { cwd, files, ahead } => {
                         git_busy_c.set(false);
                         if *last.borrow() == cwd {
                             let count = files.len();
@@ -180,12 +214,26 @@ fn build_ui(app: &Application) {
                             );
                             gitpanel::populate(&git_list_c, &files);
                             *git_files_c.borrow_mut() = files;
+                            gitpanel::update_push_button(&push_btn_c, ahead);
                         }
                     }
                     UiResult::Diff { title, result } => match result {
                         Ok(diff_text) => diff::open_readonly(&title, &diff_text, &nb_c),
                         Err(message) => {
                             diff::open_message("diff unavailable", &title, &message, &nb_c)
+                        }
+                    },
+                    UiResult::Push { result } => match result {
+                        Ok(()) => {
+                            push_btn_c.set_visible(false);
+                        }
+                        Err(msg) => {
+                            push_btn_c.set_sensitive(true);
+                            gtk4::AlertDialog::builder()
+                                .message("Push failed")
+                                .detail(&msg)
+                                .build()
+                                .show(Some(&win_c));
                         }
                     },
                 }
@@ -237,7 +285,8 @@ fn build_ui(app: &Application) {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     let files = git::changed_files(&cwd);
-                    let _ = tx.send(UiResult::Git { cwd, files });
+                    let ahead = git::ahead_count(&cwd);
+                    let _ = tx.send(UiResult::Git { cwd, files, ahead });
                 });
             }
             glib::ControlFlow::Continue
@@ -418,6 +467,72 @@ fn build_ui(app: &Application) {
                     let entries = filetree::scan_subtree(&file_path);
                     let _ = tx.send(UiResult::Subtree { path: file_path, entries });
                 });
+            }
+        });
+    }
+
+    // Push button: run git push in background thread
+    {
+        let last_cwd_c = Rc::clone(&last_cwd);
+        let tx = ui_tx.clone();
+        push_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            btn.set_label("pushing…");
+            let cwd = last_cwd_c.borrow().clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = git::push(&cwd);
+                let _ = tx.send(UiResult::Push { result });
+            });
+        });
+    }
+
+    // Activity bar: switch panel stack page; clicking active icon toggles sidebar
+    {
+        let stack = panel_stack.clone();
+        let sidebar = tree_sidebar.clone();
+        let btn_f = btn_files.clone();
+        let btn_g = btn_git.clone();
+        let paned = root_paned.clone();
+        let vis = Rc::clone(&sidebar_visible);
+        btn_files.connect_clicked(move |_| {
+            let showing_files = stack.visible_child_name().as_deref() == Some("files");
+            if showing_files && sidebar.is_visible() {
+                vis.set(false);
+                sidebar.set_visible(false);
+            } else {
+                vis.set(true);
+                if !sidebar.is_visible() {
+                    sidebar.set_visible(true);
+                    paned.set_position(220);
+                }
+                stack.set_visible_child_name("files");
+                btn_f.add_css_class("active");
+                btn_g.remove_css_class("active");
+            }
+        });
+    }
+    {
+        let stack = panel_stack.clone();
+        let sidebar = tree_sidebar.clone();
+        let btn_f = btn_files.clone();
+        let btn_g = btn_git.clone();
+        let paned = root_paned.clone();
+        let vis = Rc::clone(&sidebar_visible);
+        btn_git.connect_clicked(move |_| {
+            let showing_git = stack.visible_child_name().as_deref() == Some("git");
+            if showing_git && sidebar.is_visible() {
+                vis.set(false);
+                sidebar.set_visible(false);
+            } else {
+                vis.set(true);
+                if !sidebar.is_visible() {
+                    sidebar.set_visible(true);
+                    paned.set_position(220);
+                }
+                stack.set_visible_child_name("git");
+                btn_g.add_css_class("active");
+                btn_f.remove_css_class("active");
             }
         });
     }
@@ -706,6 +821,47 @@ fn build_css(cfg: &config::Config) -> String {
         }}
         .browser-nav entry:focus {{
             border-color: #cba6f7;
+        }}
+
+        .activity-bar {{
+            background-color: #11111b;
+            border-right: 1px solid #313244;
+            padding: 4px 0;
+        }}
+        .activity-btn {{
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            box-shadow: none;
+            padding: 10px;
+            min-width: 40px;
+            min-height: 40px;
+            color: #6c7086;
+        }}
+        .activity-btn:hover {{
+            color: #cdd6f4;
+            background-color: rgba(255,255,255,0.05);
+        }}
+        .activity-btn.active {{
+            color: #cdd6f4;
+            border-left: 2px solid #cba6f7;
+        }}
+
+        .push-btn {{
+            background-color: #313244;
+            color: #a6e3a1;
+            border: none;
+            border-radius: 4px;
+            padding: 6px 12px;
+            margin: 6px 8px 8px 8px;
+            font-size: {sidebar_pt}pt;
+            font-weight: bold;
+        }}
+        .push-btn:hover {{
+            background-color: #45475a;
+        }}
+        .push-btn:disabled {{
+            color: #6c7086;
         }}
         ",
         p = cfg.window.padding,

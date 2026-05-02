@@ -1,7 +1,7 @@
 use crate::git;
 use gtk4::prelude::*;
 
-pub fn build() -> (gtk4::Box, gtk4::Label, gtk4::ListBox) {
+pub fn build() -> (gtk4::Box, gtk4::Label, gtk4::ListBox, gtk4::Button) {
     let header = gtk4::Label::new(Some("GIT CHANGES"));
     header.set_xalign(0.0);
     header.add_css_class("sidebar-header");
@@ -16,11 +16,26 @@ pub fn build() -> (gtk4::Box, gtk4::Label, gtk4::ListBox) {
     scroll.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
     scroll.set_vexpand(true);
 
+    let push_btn = gtk4::Button::with_label("↑  push");
+    push_btn.add_css_class("push-btn");
+    push_btn.set_visible(false);
+
     let panel = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     panel.append(&header);
     panel.append(&scroll);
+    panel.append(&push_btn);
 
-    (panel, header, list)
+    (panel, header, list, push_btn)
+}
+
+pub fn update_push_button(btn: &gtk4::Button, ahead: u32) {
+    if ahead == 0 {
+        btn.set_visible(false);
+    } else {
+        btn.set_label(&format!("↑  push  {ahead}"));
+        btn.set_sensitive(true);
+        btn.set_visible(true);
+    }
 }
 
 pub fn populate(list: &gtk4::ListBox, files: &[git::GitFile]) {
