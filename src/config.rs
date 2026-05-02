@@ -10,6 +10,7 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub window: WindowConfig,
     pub behavior: BehaviorConfig,
+    pub tasks: Vec<crate::runpanel::Task>,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +135,11 @@ allow_hyperlinks = true
 # Hide mouse cursor while typing
 mouse_autohide = true
 audible_bell = false
+
+# Global run-panel tasks (available in every project)
+# [[tasks]]
+# name = "My task"
+# cmd  = "echo hello"
 "#;
 
 impl Config {

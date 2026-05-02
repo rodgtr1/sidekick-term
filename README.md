@@ -126,10 +126,14 @@ Changed git files open as read-only diff tabs when activated from the git panel.
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+Shift+Tab` | Previous tab |
 | `Ctrl+Shift+D` | Split terminal right |
-| `Ctrl+Shift+E` | Split terminal down |
+| `Ctrl+Shift+X` | Split terminal down |
 | `Alt+Left` | Focus previous terminal pane |
 | `Alt+Right` | Focus next terminal pane |
-| `Ctrl+Shift+B` | Toggle file tree sidebar |
+| `Ctrl+Shift+E` | Show file explorer panel |
+| `Ctrl+Shift+G` | Show git panel |
+| `Ctrl+Shift+S` | Show search panel |
+| `Ctrl+Shift+R` | Show run panel |
+| `Ctrl+Shift+B` | Toggle sidebar |
 | `Ctrl+Shift+O` | Toggle embedded browser panel |
 | `Ctrl+S` | Save the current editor tab |
 
@@ -253,8 +257,11 @@ The main modules are:
 - `src/filetree.rs`: cwd-aware project tree.
 - `src/editor.rs`: editor tabs backed by GtkSourceView.
 - `src/git.rs` and `src/gitpanel.rs`: git status and changed-file UI.
+- `src/searchpanel.rs`: file content search (ripgrep/grep).
+- `src/runpanel.rs`: task runner with global and project-local tasks.
 - `src/diff.rs`: colored diff views and accept/reject diff tabs.
 - `src/browser.rs`: optional WebKit side panel.
+- `src/config.rs`: configuration loading and defaults.
 - `src/ipc.rs`: Unix-socket IPC server.
 
 ## Contributing

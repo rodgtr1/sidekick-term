@@ -651,6 +651,7 @@ dependencies = [
  "gio",
  "glib",
  "gtk4",
+ "indexmap",
  "libc",
  "pango",
  "serde",

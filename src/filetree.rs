@@ -10,6 +10,7 @@ pub const COL_IS_DIR: u32 = 2;
 pub const COL_IGNORED: u32 = 3;
 const MAX_DEPTH: u32 = 2;
 const PLACEHOLDER_PATH: &str = "//placeholder//";
+const LOADING_PATH: &str = "//loading//";
 
 #[derive(Clone, Debug)]
 pub struct TreeEntry {
@@ -68,7 +69,7 @@ pub fn build() -> (
                 .get_value(iter, COL_PATH as i32)
                 .get::<String>()
                 .unwrap_or_default();
-            if path == PLACEHOLDER_PATH {
+            if path == PLACEHOLDER_PATH || path == LOADING_PATH {
                 cell.set_property("gicon", &gio::ThemedIcon::new("text-x-generic"));
                 return;
             }
@@ -105,6 +106,11 @@ pub fn build() -> (
                 .unwrap_or_default();
             if path == PLACEHOLDER_PATH {
                 cell.set_property("text", "");
+                cell.set_property("foreground", "#45475a");
+                return;
+            }
+            if path == LOADING_PATH {
+                cell.set_property("text", "Loading…");
                 cell.set_property("foreground", "#45475a");
                 return;
             }
@@ -193,8 +199,15 @@ pub fn find_iter_by_file_path(
     store: &gtk4::TreeStore,
     file_path: &str,
 ) -> Option<gtk4::TreeIter> {
-    let iter = store.iter_first()?;
-    find_iter_recursive(store, &iter, file_path)
+    let mut iter = store.iter_first()?;
+    loop {
+        if let Some(found) = find_iter_recursive(store, &iter, file_path) {
+            return Some(found);
+        }
+        if !store.iter_next(&mut iter) {
+            return None;
+        }
+    }
 }
 
 pub fn has_placeholder(store: &gtk4::TreeStore, iter: &gtk4::TreeIter) -> bool {
@@ -206,6 +219,19 @@ pub fn has_placeholder(store: &gtk4::TreeStore, iter: &gtk4::TreeIter) -> bool {
             .map(|p| p == PLACEHOLDER_PATH)
             .unwrap_or(false),
     }
+}
+
+/// Replace the placeholder child with a "Loading…" row so the parent row
+/// stays visually open while the subtree scan runs in the background.
+pub fn set_loading(store: &gtk4::TreeStore, parent: &gtk4::TreeIter) {
+    if let Some(child) = store.iter_children(Some(parent)) {
+        store.remove(&child);
+    }
+    let row = store.append(Some(parent));
+    store.set_value(&row, COL_NAME, &"Loading…".to_value());
+    store.set_value(&row, COL_PATH, &LOADING_PATH.to_value());
+    store.set_value(&row, COL_IS_DIR, &false.to_value());
+    store.set_value(&row, COL_IGNORED, &false.to_value());
 }
 
 fn find_iter_recursive(

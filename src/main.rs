@@ -8,6 +8,8 @@ mod gitpanel;
 mod ipc;
 mod limits;
 mod pane;
+mod runpanel;
+mod searchpanel;
 mod tab;
 mod theme;
 
@@ -26,6 +28,7 @@ enum UiResult {
         shell_cwd: String,
         tree_root: String,
         entries: Vec<filetree::TreeEntry>,
+        tasks: Vec<runpanel::Task>,
     },
     Subtree {
         path: String,
@@ -42,6 +45,10 @@ enum UiResult {
     },
     Push {
         result: Result<(), String>,
+    },
+    SearchDone {
+        gen: u64,
+        results: Vec<searchpanel::FileMatches>,
     },
 }
 
@@ -68,17 +75,26 @@ fn build_ui(app: &Application) {
     let (git_panel, git_list_header, git_list, push_btn) = gitpanel::build();
     let git_files: Rc<RefCell<Vec<git::GitFile>>> = Rc::new(RefCell::new(Vec::new()));
 
+    // Search panel
+    let (search_panel, search_entry, search_list) = searchpanel::build();
+    let search_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
+    // Run panel
+    let (run_panel, run_list) = runpanel::build();
+
     // File tree page (header + scroll stacked vertically)
     let files_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     files_page.append(&tree_header);
     files_page.append(&tree_scroll);
 
-    // Panel stack switches between file tree and git panel
+    // Panel stack switches between panels
     let panel_stack = gtk4::Stack::new();
     panel_stack.set_transition_type(gtk4::StackTransitionType::None);
-    panel_stack.set_hexpand(true);
+    panel_stack.set_hexpand(false);
     panel_stack.add_named(&files_page, Some("files"));
     panel_stack.add_named(&git_panel, Some("git"));
+    panel_stack.add_named(&search_panel, Some("search"));
+    panel_stack.add_named(&run_panel, Some("run"));
 
     // Activity bar: narrow icon strip on the far left
     let activity_bar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -91,17 +107,33 @@ fn build_ui(app: &Application) {
     let img_files = gtk4::Image::from_icon_name("folder-symbolic");
     img_files.set_pixel_size(20);
     btn_files.set_child(Some(&img_files));
-    btn_files.set_tooltip_text(Some("Explorer"));
+    btn_files.set_tooltip_text(Some("Explorer (Ctrl+Shift+E)"));
 
     let btn_git = gtk4::Button::new();
     btn_git.add_css_class("activity-btn");
     let img_git = gtk4::Image::from_icon_name("emblem-synchronizing-symbolic");
     img_git.set_pixel_size(20);
     btn_git.set_child(Some(&img_git));
-    btn_git.set_tooltip_text(Some("Source Control"));
+    btn_git.set_tooltip_text(Some("Source Control (Ctrl+Shift+G)"));
+
+    let btn_search = gtk4::Button::new();
+    btn_search.add_css_class("activity-btn");
+    let img_search = gtk4::Image::from_icon_name("edit-find-symbolic");
+    img_search.set_pixel_size(20);
+    btn_search.set_child(Some(&img_search));
+    btn_search.set_tooltip_text(Some("Search (Ctrl+Shift+S)"));
+
+    let btn_run = gtk4::Button::new();
+    btn_run.add_css_class("activity-btn");
+    let img_run = gtk4::Image::from_icon_name("media-playback-start-symbolic");
+    img_run.set_pixel_size(20);
+    btn_run.set_child(Some(&img_run));
+    btn_run.set_tooltip_text(Some("Run Tasks (Ctrl+Shift+R)"));
 
     activity_bar.append(&btn_files);
     activity_bar.append(&btn_git);
+    activity_bar.append(&btn_search);
+    activity_bar.append(&btn_run);
 
     // Panel stack is the togglable sidebar content (no activity bar inside)
     let tree_sidebar = panel_stack.clone();
@@ -122,20 +154,13 @@ fn build_ui(app: &Application) {
     content_paned.set_resize_start_child(true);
     content_paned.set_resize_end_child(true);
 
-    // Root paned: panel stack | content_paned
-    let root_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
-    root_paned.set_start_child(Some(&tree_sidebar));
-    root_paned.set_end_child(Some(&content_paned));
-    root_paned.set_shrink_start_child(false);
-    root_paned.set_shrink_end_child(false);
-    root_paned.set_resize_start_child(false);
-    root_paned.set_resize_end_child(true);
-    root_paned.set_position(220);
+    content_paned.set_hexpand(true);
 
-    // Root layout: activity bar (always visible) | root paned
+    // Root layout: activity bar (always visible) | sidebar | content
     let root_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     root_box.append(&activity_bar);
-    root_box.append(&root_paned);
+    root_box.append(&tree_sidebar);
+    root_box.append(&content_paned);
 
     // Sidebar visible by default
     let sidebar_visible: Rc<Cell<bool>> = Rc::new(Cell::new(true));
@@ -181,10 +206,16 @@ fn build_ui(app: &Application) {
         let nb_c = notebook.clone();
         let push_btn_c = push_btn.clone();
         let win_c = window.clone();
+        let search_list_c = search_list.clone();
+        let search_gen_c = Rc::clone(&search_gen);
+        let run_list_c = run_list.clone();
+        let nb_run_c = notebook.clone();
+        let win_run_c = window.clone();
+        let cfg_c = Rc::clone(&cfg);
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             while let Ok(result) = rx.borrow_mut().try_recv() {
                 match result {
-                    UiResult::Tree { shell_cwd, tree_root, entries } => {
+                    UiResult::Tree { shell_cwd, tree_root, entries, tasks } => {
                         tree_busy_c.set(false);
                         if *last.borrow() == shell_cwd {
                             let name = std::path::Path::new(&tree_root)
@@ -193,11 +224,25 @@ fn build_ui(app: &Application) {
                                 .unwrap_or_else(|| tree_root.clone());
                             header_c.set_text(&name);
                             filetree::apply_root(&store, &tv, &entries);
+                            let win_r = win_run_c.clone();
+                            let nb_r = nb_run_c.clone();
+                            runpanel::populate(&run_list_c, &cfg_c.tasks, &tasks, move |cmd, run| {
+                                if let Some(term) = focused_terminal(&win_r, &nb_r) {
+                                    let mut bytes = cmd.as_bytes().to_vec();
+                                    if run { bytes.push(b'\n'); }
+                                    term.feed_child(&bytes);
+                                    term.grab_focus();
+                                }
+                            });
                         }
                     }
                     UiResult::Subtree { path, entries } => {
                         if let Some(iter) = filetree::find_iter_by_file_path(&store, &path) {
                             filetree::apply_subtree(&store, &iter, &entries);
+                            // clear_children briefly leaves 0 children, collapsing the row.
+                            // Re-expand it now that real entries are in place.
+                            #[allow(deprecated)]
+                            tv.expand_row(&store.path(&iter), false);
                         }
                     }
                     UiResult::Git { cwd, files, ahead } => {
@@ -236,6 +281,11 @@ fn build_ui(app: &Application) {
                                 .show(Some(&win_c));
                         }
                     },
+                    UiResult::SearchDone { gen, results } => {
+                        if gen == search_gen_c.get() {
+                            searchpanel::populate(&search_list_c, &results);
+                        }
+                    }
                 }
             }
             glib::ControlFlow::Continue
@@ -261,10 +311,12 @@ fn build_ui(app: &Application) {
                         let tree_root = git::repo_root(&shell_cwd)
                             .unwrap_or_else(|| shell_cwd.clone());
                         let entries = filetree::scan_root(&tree_root);
+                        let tasks = runpanel::load_tasks(&tree_root);
                         let _ = tx.send(UiResult::Tree {
                             shell_cwd,
                             tree_root,
                             entries,
+                            tasks,
                         });
                     });
                 }
@@ -326,18 +378,60 @@ fn build_ui(app: &Application) {
         });
     }
 
+    // Open file in editor when a search result is clicked
+    {
+        let nb_c = notebook.clone();
+        let cfg_c = Rc::clone(&cfg);
+        search_list.connect_row_activated(move |_, row| {
+            let name = row.widget_name().to_string();
+            // widget name is "abs_path:line"
+            if let Some(path) = name.splitn(2, ':').next() {
+                editor::open(path, &nb_c, &cfg_c);
+            }
+        });
+    }
+
+    // Shared panel-switching logic for both activity bar buttons and keyboard shortcuts.
+    let all_btns = [btn_files.clone(), btn_git.clone(), btn_search.clone(), btn_run.clone()];
+    let switch_panel: Rc<dyn Fn(&'static str, usize)> = Rc::new({
+        let stack = panel_stack.clone();
+        let sidebar = tree_sidebar.clone();
+        let vis = Rc::clone(&sidebar_visible);
+        let btns = all_btns.clone();
+        move |page: &'static str, btn_idx: usize| {
+            let already =
+                stack.visible_child_name().as_deref() == Some(page) && sidebar.is_visible();
+            if already {
+                vis.set(false);
+                sidebar.set_visible(false);
+            } else {
+                vis.set(true);
+                sidebar.set_visible(true);
+                stack.set_visible_child_name(page);
+                for (i, b) in btns.iter().enumerate() {
+                    if i == btn_idx {
+                        b.add_css_class("active");
+                    } else {
+                        b.remove_css_class("active");
+                    }
+                }
+            }
+        }
+    });
+
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
     {
         let nb = notebook.clone();
         let cfg = Rc::clone(&cfg);
         let win = window.clone();
-        let paned = root_paned.clone();
         let sidebar_vis = Rc::clone(&sidebar_visible);
         let scroll = tree_sidebar.clone();
         let browser_vis = Rc::clone(&browser_visible);
         let browser_wgt = browser_panel.widget.clone();
         let browser_wv = browser_panel.webview.clone();
+        let switch_panel = Rc::clone(&switch_panel);
+        let search_entry_k = search_entry.clone();
         let cpaned = content_paned.clone();
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
             let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
@@ -375,8 +469,27 @@ fn build_ui(app: &Application) {
                     glib::Propagation::Stop
                 }
                 // Split down (top / bottom)
-                (true, true, false, gdk::Key::e | gdk::Key::E) => {
+                (true, true, false, gdk::Key::x | gdk::Key::X) => {
                     pane::split(&win, &nb, &cfg, gtk4::Orientation::Vertical);
+                    glib::Propagation::Stop
+                }
+                // Panel shortcuts
+                (true, true, false, gdk::Key::e | gdk::Key::E) => {
+                    switch_panel("files", 0);
+                    glib::Propagation::Stop
+                }
+                (true, true, false, gdk::Key::g | gdk::Key::G) => {
+                    switch_panel("git", 1);
+                    glib::Propagation::Stop
+                }
+                (true, true, false, gdk::Key::s | gdk::Key::S) => {
+                    switch_panel("search", 2);
+                    let e = search_entry_k.clone();
+                    glib::idle_add_local_once(move || { e.grab_focus(); });
+                    glib::Propagation::Stop
+                }
+                (true, true, false, gdk::Key::r | gdk::Key::R) => {
+                    switch_panel("run", 3);
                     glib::Propagation::Stop
                 }
                 // Navigate panes
@@ -411,9 +524,6 @@ fn build_ui(app: &Application) {
                     let visible = !sidebar_vis.get();
                     sidebar_vis.set(visible);
                     scroll.set_visible(visible);
-                    if visible {
-                        paned.set_position(220);
-                    }
                     glib::Propagation::Stop
                 }
                 // Toggle browser panel
@@ -454,13 +564,16 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Lazy-load directory children when a row with a placeholder is expanded
+    // Lazy-load directory children when a row with a placeholder is expanded.
+    // We replace the placeholder with a "Loading…" row immediately so the
+    // parent stays open while the background scan runs.
     {
         let store = Rc::clone(&tree_store);
         let tx = ui_tx.clone();
         #[allow(deprecated)]
         tree_view.connect_row_expanded(move |_tv, iter, _path| {
             if filetree::has_placeholder(&store, iter) {
+                filetree::set_loading(&store, iter);
                 let (file_path, _) = filetree::row_info(&store, iter);
                 let tx = tx.clone();
                 std::thread::spawn(move || {
@@ -487,53 +600,41 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Activity bar: switch panel stack page; clicking active icon toggles sidebar
-    {
-        let stack = panel_stack.clone();
-        let sidebar = tree_sidebar.clone();
-        let btn_f = btn_files.clone();
-        let btn_g = btn_git.clone();
-        let paned = root_paned.clone();
-        let vis = Rc::clone(&sidebar_visible);
-        btn_files.connect_clicked(move |_| {
-            let showing_files = stack.visible_child_name().as_deref() == Some("files");
-            if showing_files && sidebar.is_visible() {
-                vis.set(false);
-                sidebar.set_visible(false);
-            } else {
-                vis.set(true);
-                if !sidebar.is_visible() {
-                    sidebar.set_visible(true);
-                    paned.set_position(220);
-                }
-                stack.set_visible_child_name("files");
-                btn_f.add_css_class("active");
-                btn_g.remove_css_class("active");
+    for (idx, (btn, page)) in [
+        (btn_files.clone(), "files"),
+        (btn_git.clone(),   "git"),
+        (btn_search.clone(),"search"),
+        (btn_run.clone(),   "run"),
+    ].into_iter().enumerate() {
+        let sp = Rc::clone(&switch_panel);
+        let entry_c = (page == "search").then(|| search_entry.clone());
+        btn.connect_clicked(move |_| {
+            sp(page, idx);
+            if let Some(e) = &entry_c {
+                let e = e.clone();
+                glib::idle_add_local_once(move || { e.grab_focus(); });
             }
         });
     }
+
+    // Search: run on Enter, cancel stale results with a generation counter
     {
-        let stack = panel_stack.clone();
-        let sidebar = tree_sidebar.clone();
-        let btn_f = btn_files.clone();
-        let btn_g = btn_git.clone();
-        let paned = root_paned.clone();
-        let vis = Rc::clone(&sidebar_visible);
-        btn_git.connect_clicked(move |_| {
-            let showing_git = stack.visible_child_name().as_deref() == Some("git");
-            if showing_git && sidebar.is_visible() {
-                vis.set(false);
-                sidebar.set_visible(false);
-            } else {
-                vis.set(true);
-                if !sidebar.is_visible() {
-                    sidebar.set_visible(true);
-                    paned.set_position(220);
-                }
-                stack.set_visible_child_name("git");
-                btn_g.add_css_class("active");
-                btn_f.remove_css_class("active");
-            }
+        let last_cwd_c = Rc::clone(&last_cwd);
+        let tx = ui_tx.clone();
+        let gen_c = Rc::clone(&search_gen);
+        search_entry.connect_activate(move |entry| {
+            let query = entry.text().to_string();
+            let root = {
+                let cwd = last_cwd_c.borrow().clone();
+                git::repo_root(&cwd).unwrap_or(cwd)
+            };
+            let gen = gen_c.get() + 1;
+            gen_c.set(gen);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let results = searchpanel::run_search(&root, &query);
+                let _ = tx.send(UiResult::SearchDone { gen, results });
+            });
         });
     }
 
@@ -678,24 +779,18 @@ fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
     });
 }
 
-fn focused_terminal_cwd(window: &ApplicationWindow, notebook: &Notebook) -> Option<String> {
-    // Try focused terminal first
-    if let Some(term) =
-        gtk4::prelude::GtkWindowExt::focus(window).and_then(|w| w.downcast::<vte4::Terminal>().ok())
+fn focused_terminal(window: &ApplicationWindow, notebook: &Notebook) -> Option<vte4::Terminal> {
+    if let Some(term) = gtk4::prelude::GtkWindowExt::focus(window)
+        .and_then(|w| w.downcast::<vte4::Terminal>().ok())
     {
-        if let Some(cwd) = terminal_cwd(&term) {
-            return Some(cwd);
-        }
+        return Some(term);
     }
-
-    // Fall back to first terminal in current page
     let page = notebook.nth_page(Some(notebook.current_page()?))?;
-    for term in pane::collect_terminals_pub(&page) {
-        if let Some(cwd) = terminal_cwd(&term) {
-            return Some(cwd);
-        }
-    }
-    None
+    pane::collect_terminals_pub(&page).into_iter().next()
+}
+
+fn focused_terminal_cwd(window: &ApplicationWindow, notebook: &Notebook) -> Option<String> {
+    focused_terminal(window, notebook).and_then(|t| terminal_cwd(&t))
 }
 
 /// Get the cwd of the foreground process running in a terminal via the PTY.
@@ -727,6 +822,7 @@ fn build_css(cfg: &config::Config) -> String {
     let font = &cfg.font.family;
     let fsize = cfg.font.size;
     let sidebar_pt = (fsize - 2).max(10);
+    let run_task_pt = (fsize - 4).max(9);
     format!(
         "
         window {{ background: transparent; }}
@@ -862,6 +958,43 @@ fn build_css(cfg: &config::Config) -> String {
         }}
         .push-btn:disabled {{
             color: #6c7086;
+        }}
+
+        .search-result-file {{
+            color: #89b4fa;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+            font-weight: bold;
+        }}
+        .search-result-line {{
+            color: #6c7086;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+        .search-result-text {{
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+
+        .run-task-name {{
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {run_task_pt}pt;
+        }}
+        .run-btn {{
+            background-color: transparent;
+            border: none;
+            border-radius: 4px;
+            color: #6c7086;
+            padding: 0 4px;
+            min-width: 0;
+            min-height: 0;
+            font-size: {sidebar_pt}pt;
+        }}
+        .run-btn:hover {{
+            background-color: #313244;
+            color: #cdd6f4;
         }}
         ",
         p = cfg.window.padding,
