@@ -7,6 +7,7 @@ use pango::EllipsizeMode;
 pub const COL_NAME: u32 = 0;
 pub const COL_PATH: u32 = 1;
 pub const COL_IS_DIR: u32 = 2;
+pub const COL_IGNORED: u32 = 3;
 pub const MAX_DEPTH: u32 = 1;
 
 #[derive(Clone, Debug)]
@@ -14,6 +15,7 @@ pub struct TreeEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    pub ignored: bool,
     pub children: Vec<TreeEntry>,
 }
 
@@ -25,7 +27,12 @@ pub fn build() -> (
     gtk4::TreeStore,
     gtk4::ScrolledWindow,
 ) {
-    let store = gtk4::TreeStore::new(&[glib::Type::STRING, glib::Type::STRING, glib::Type::BOOL]);
+    let store = gtk4::TreeStore::new(&[
+        glib::Type::STRING,
+        glib::Type::STRING,
+        glib::Type::BOOL,
+        glib::Type::BOOL,
+    ]);
 
     let tree = gtk4::TreeView::new();
     tree.set_model(Some(&store));
@@ -50,7 +57,6 @@ pub fn build() -> (
 
     col.pack_start(&icon_cell, false);
     col.pack_start(&text_cell, true);
-    col.add_attribute(&text_cell, "text", COL_NAME as i32);
 
     col.set_cell_data_func(
         &icon_cell,
@@ -73,6 +79,28 @@ pub fn build() -> (
         },
     );
 
+    col.set_cell_data_func(
+        &text_cell,
+        |_col: &gtk4::TreeViewColumn,
+         cell: &gtk4::CellRenderer,
+         model: &gtk4::TreeModel,
+         iter: &gtk4::TreeIter| {
+            let name = model
+                .get_value(iter, COL_NAME as i32)
+                .get::<String>()
+                .unwrap_or_default();
+            let ignored = model
+                .get_value(iter, COL_IGNORED as i32)
+                .get::<bool>()
+                .unwrap_or(false);
+            cell.set_property("text", name);
+            cell.set_property(
+                "foreground",
+                if ignored { "#45475a" } else { "#cdd6f4" },
+            );
+        },
+    );
+
     tree.append_column(&col);
 
     let scroll = gtk4::ScrolledWindow::new();
@@ -90,11 +118,14 @@ pub fn build() -> (
 }
 
 pub fn scan_root(root: &str) -> Vec<TreeEntry> {
-    scan_dir(root, 0)
+    let ignored = crate::git::ignored_set(root);
+    scan_dir(root, 0, &ignored)
 }
 
 pub fn scan_subtree(path: &str) -> Vec<TreeEntry> {
-    scan_dir(path, 1)
+    let root = crate::git::repo_root(path).unwrap_or_else(|| path.to_string());
+    let ignored = crate::git::ignored_set(&root);
+    scan_dir(path, 1, &ignored)
 }
 
 pub fn apply_root(store: &gtk4::TreeStore, entries: &[TreeEntry]) {
@@ -165,7 +196,11 @@ fn clear_children(store: &gtk4::TreeStore, parent: &gtk4::TreeIter) {
     }
 }
 
-fn scan_dir(path: &str, depth: u32) -> Vec<TreeEntry> {
+fn scan_dir(
+    path: &str,
+    depth: u32,
+    ignored: &std::collections::HashSet<String>,
+) -> Vec<TreeEntry> {
     let mut entries: Vec<TreeEntry> = std::fs::read_dir(path)
         .into_iter()
         .flatten()
@@ -173,15 +208,17 @@ fn scan_dir(path: &str, depth: u32) -> Vec<TreeEntry> {
         .take(crate::limits::MAX_DIRECTORY_ENTRIES)
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if name == ".git" {
                 return None;
             }
             let full = e.path().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let entry_ignored = ignored.contains(&full);
             Some(TreeEntry {
                 name,
                 path: full,
                 is_dir,
+                ignored: entry_ignored,
                 children: Vec::new(),
             })
         })
@@ -192,7 +229,7 @@ fn scan_dir(path: &str, depth: u32) -> Vec<TreeEntry> {
     if depth < MAX_DEPTH {
         for entry in &mut entries {
             if entry.is_dir {
-                entry.children = scan_dir(&entry.path, depth + 1);
+                entry.children = scan_dir(&entry.path, depth + 1, ignored);
             }
         }
     }
@@ -206,6 +243,7 @@ fn apply_entries(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, entri
         store.set_value(&iter, COL_NAME, &entry.name.to_value());
         store.set_value(&iter, COL_PATH, &entry.path.to_value());
         store.set_value(&iter, COL_IS_DIR, &entry.is_dir.to_value());
+        store.set_value(&iter, COL_IGNORED, &entry.ignored.to_value());
         apply_entries(store, Some(&iter), &entry.children);
     }
 }

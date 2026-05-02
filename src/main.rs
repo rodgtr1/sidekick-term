@@ -23,7 +23,8 @@ const APP_ID: &str = "com.travismedia.sidekick";
 
 enum UiResult {
     Tree {
-        cwd: String,
+        shell_cwd: String,
+        tree_root: String,
         entries: Vec<filetree::TreeEntry>,
     },
     Subtree {
@@ -138,6 +139,7 @@ fn build_ui(app: &Application) {
         let rx = Rc::clone(&ui_rx);
         let store = Rc::clone(&tree_store);
         let last = Rc::clone(&last_cwd);
+        let header_c = tree_header.clone();
         let git_list_c = git_list.clone();
         let git_hdr_c = git_list_header.clone();
         let git_files_c = Rc::clone(&git_files);
@@ -147,9 +149,14 @@ fn build_ui(app: &Application) {
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             while let Ok(result) = rx.borrow_mut().try_recv() {
                 match result {
-                    UiResult::Tree { cwd, entries } => {
+                    UiResult::Tree { shell_cwd, tree_root, entries } => {
                         tree_busy_c.set(false);
-                        if *last.borrow() == cwd {
+                        if *last.borrow() == shell_cwd {
+                            let name = std::path::Path::new(&tree_root)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| tree_root.clone());
+                            header_c.set_text(&name);
                             filetree::apply_root(&store, &entries);
                         }
                     }
@@ -191,7 +198,6 @@ fn build_ui(app: &Application) {
         let nb = notebook.clone();
         let last = Rc::clone(&last_cwd);
         let win = window.clone();
-        let header = tree_header.clone();
         let tx = ui_tx.clone();
         let tree_busy_c = Rc::clone(&tree_busy);
         glib::timeout_add_seconds_local(1, move || {
@@ -199,18 +205,16 @@ fn build_ui(app: &Application) {
                 let mut prev = last.borrow_mut();
                 if *prev != cwd {
                     *prev = cwd.clone();
-                    let name = std::path::Path::new(&cwd)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| cwd.clone());
-                    header.set_text(&name);
                     tree_busy_c.set(true);
                     let tx = tx.clone();
-                    let cwd_for_thread = cwd.clone();
+                    let shell_cwd = cwd.clone();
                     std::thread::spawn(move || {
-                        let entries = filetree::scan_root(&cwd_for_thread);
+                        let tree_root = git::repo_root(&shell_cwd)
+                            .unwrap_or_else(|| shell_cwd.clone());
+                        let entries = filetree::scan_root(&tree_root);
                         let _ = tx.send(UiResult::Tree {
-                            cwd: cwd_for_thread,
+                            shell_cwd,
+                            tree_root,
                             entries,
                         });
                     });

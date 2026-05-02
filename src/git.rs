@@ -42,6 +42,34 @@ pub struct GitFile {
     pub staged: bool,
 }
 
+pub fn ignored_set(root: &str) -> std::collections::HashSet<String> {
+    let Ok(out) = Command::new("git")
+        .args([
+            "-C", root,
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ])
+        .output()
+    else {
+        return Default::default();
+    };
+    if !out.status.success() {
+        return Default::default();
+    }
+    let mut set = std::collections::HashSet::new();
+    for path in String::from_utf8_lossy(&out.stdout).split('\0') {
+        if path.is_empty() {
+            continue;
+        }
+        set.insert(format!("{}/{}", root, path.trim_end_matches('/')));
+    }
+    set
+}
+
 pub fn repo_root(cwd: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", cwd, "rev-parse", "--show-toplevel"])
