@@ -1,4 +1,5 @@
 use crate::config::Config;
+use gtk4::{gdk, prelude::*};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -38,6 +39,32 @@ pub fn build(cfg: &Config) -> Terminal {
     terminal.set_allow_hyperlink(cfg.behavior.allow_hyperlinks);
     terminal.set_mouse_autohide(cfg.behavior.mouse_autohide);
     terminal.set_audible_bell(cfg.behavior.audible_bell);
+
+    // Register a URL regex so plain https?:// links get a pointer cursor on hover.
+    if let Ok(re) = vte4::Regex::for_match("https?://[^\\s\\])'\">\x01-\x1f]+", 0) {
+        let tag = terminal.match_add_regex(&re, 0);
+        terminal.match_set_cursor_name(tag, "pointer");
+    }
+
+    // Ctrl+click opens hyperlinks (OSC 8) and regex-matched URLs via xdg-open.
+    {
+        let term_c = terminal.clone();
+        let gesture = gtk4::GestureClick::new();
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            let mods = gesture.current_event_state();
+            if !mods.contains(gdk::ModifierType::CONTROL_MASK) {
+                return;
+            }
+            let uri = term_c
+                .check_hyperlink_at(x, y)
+                .or_else(|| term_c.check_match_at(x, y).0);
+            if let Some(uri) = uri {
+                let _ = std::process::Command::new("xdg-open").arg(uri.as_str()).spawn();
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+            }
+        });
+        terminal.add_controller(gesture);
+    }
 
     terminal
 }

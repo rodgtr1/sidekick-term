@@ -206,6 +206,37 @@ pub fn ahead_count(cwd: &str) -> u32 {
     }
 }
 
+pub fn stage(root: &str, rel_path: &str) -> Result<(), String> {
+    run_git(root, &["add", "--", rel_path])
+}
+
+pub fn unstage(root: &str, rel_path: &str) -> Result<(), String> {
+    run_git(root, &["restore", "--staged", "--", rel_path])
+}
+
+pub fn discard(root: &str, rel_path: &str, is_untracked: bool) -> Result<(), String> {
+    if is_untracked {
+        run_git(root, &["clean", "-f", "--", rel_path])
+    } else {
+        run_git(root, &["restore", "--", rel_path])
+    }
+}
+
+fn run_git(root: &str, args: &[&str]) -> Result<(), String> {
+    let mut full_args = vec!["-C", root];
+    full_args.extend_from_slice(args);
+    let out = Command::new("git")
+        .args(&full_args)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 pub fn push(cwd: &str) -> Result<(), String> {
     let root = repo_root(cwd).ok_or_else(|| "Not a git repository.".to_string())?;
     let out = Command::new("git")

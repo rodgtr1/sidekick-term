@@ -8,6 +8,7 @@ mod gitpanel;
 mod ipc;
 mod limits;
 mod pane;
+mod quickopen;
 mod runpanel;
 mod searchpanel;
 mod tab;
@@ -36,6 +37,7 @@ enum UiResult {
     },
     Git {
         cwd: String,
+        root: String,
         files: Vec<git::GitFile>,
         ahead: u32,
     },
@@ -121,7 +123,7 @@ fn build_ui(app: &Application) {
     let img_search = gtk4::Image::from_icon_name("edit-find-symbolic");
     img_search.set_pixel_size(20);
     btn_search.set_child(Some(&img_search));
-    btn_search.set_tooltip_text(Some("Search (Ctrl+Shift+S)"));
+    btn_search.set_tooltip_text(Some("Search in files (Ctrl+Shift+F)"));
 
     let btn_run = gtk4::Button::new();
     btn_run.add_css_class("activity-btn");
@@ -191,6 +193,23 @@ fn build_ui(app: &Application) {
     let tree_busy = Rc::new(Cell::new(false));
     let git_busy = Rc::new(Cell::new(false));
 
+    // Callback that triggers a background git status refresh (used by the context menu).
+    let refresh_git: Rc<dyn Fn()> = {
+        let last_cwd = Rc::clone(&last_cwd);
+        let tx = ui_tx.clone();
+        Rc::new(move || {
+            let cwd = last_cwd.borrow().clone();
+            if cwd.is_empty() { return; }
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
+                let files = git::changed_files(&cwd);
+                let ahead = git::ahead_count(&cwd);
+                let _ = tx.send(UiResult::Git { cwd, root, files, ahead });
+            });
+        })
+    };
+
     // Apply filesystem/git work that completed off the GTK thread.
     {
         let rx = Rc::clone(&ui_rx);
@@ -212,6 +231,7 @@ fn build_ui(app: &Application) {
         let nb_run_c = notebook.clone();
         let win_run_c = window.clone();
         let cfg_c = Rc::clone(&cfg);
+        let refresh_git_c = Rc::clone(&refresh_git);
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             while let Ok(result) = rx.borrow_mut().try_recv() {
                 match result {
@@ -245,7 +265,7 @@ fn build_ui(app: &Application) {
                             tv.expand_row(&store.path(&iter), false);
                         }
                     }
-                    UiResult::Git { cwd, files, ahead } => {
+                    UiResult::Git { cwd, root, files, ahead } => {
                         git_busy_c.set(false);
                         if *last.borrow() == cwd {
                             let count = files.len();
@@ -257,7 +277,7 @@ fn build_ui(app: &Application) {
                                 }
                                 .as_str(),
                             );
-                            gitpanel::populate(&git_list_c, &files);
+                            gitpanel::populate(&git_list_c, &files, &root, &refresh_git_c);
                             *git_files_c.borrow_mut() = files;
                             gitpanel::update_push_button(&push_btn_c, ahead);
                         }
@@ -336,9 +356,10 @@ fn build_ui(app: &Application) {
                 git_busy_c.set(true);
                 let tx = tx.clone();
                 std::thread::spawn(move || {
+                    let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
                     let files = git::changed_files(&cwd);
                     let ahead = git::ahead_count(&cwd);
-                    let _ = tx.send(UiResult::Git { cwd, files, ahead });
+                    let _ = tx.send(UiResult::Git { cwd, root, files, ahead });
                 });
             }
             glib::ControlFlow::Continue
@@ -433,6 +454,8 @@ fn build_ui(app: &Application) {
         let switch_panel = Rc::clone(&switch_panel);
         let search_entry_k = search_entry.clone();
         let cpaned = content_paned.clone();
+        let last_cwd_qo = Rc::clone(&last_cwd);
+        let cfg_qo = Rc::clone(&cfg);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
             let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
@@ -482,10 +505,19 @@ fn build_ui(app: &Application) {
                     switch_panel("git", 1);
                     glib::Propagation::Stop
                 }
-                (true, true, false, gdk::Key::s | gdk::Key::S) => {
+                (true, true, false, gdk::Key::f | gdk::Key::F) => {
                     switch_panel("search", 2);
                     let e = search_entry_k.clone();
                     glib::idle_add_local_once(move || { e.grab_focus(); });
+                    glib::Propagation::Stop
+                }
+                // Quick open: file name search
+                (true, false, false, gdk::Key::f | gdk::Key::F) => {
+                    let cwd = last_cwd_qo.borrow().clone();
+                    if !cwd.is_empty() {
+                        let root = git::repo_root(&cwd).unwrap_or(cwd);
+                        quickopen::show(&root, &win, &nb, &cfg_qo);
+                    }
                     glib::Propagation::Stop
                 }
                 (true, true, false, gdk::Key::r | gdk::Key::R) => {
@@ -960,6 +992,26 @@ fn build_css(cfg: &config::Config) -> String {
             color: #6c7086;
         }}
 
+        .context-menu {{
+            background: #1e1e2e;
+            border: 1px solid #313244;
+            border-radius: 6px;
+            padding: 4px;
+        }}
+        .context-menu-item {{
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+            padding: 4px 12px;
+            min-height: 0;
+        }}
+        .context-menu-item:hover {{
+            background: #313244;
+        }}
+
         .search-result-file {{
             color: #89b4fa;
             font-family: {font};
@@ -995,6 +1047,39 @@ fn build_css(cfg: &config::Config) -> String {
         .run-btn:hover {{
             background-color: #313244;
             color: #cdd6f4;
+        }}
+
+        .quickopen-window {{
+            background: #1e1e2e;
+            border: 1px solid #45475a;
+            border-radius: 8px;
+        }}
+        .quickopen-entry {{
+            background: #313244;
+            color: #cdd6f4;
+            border: none;
+            border-radius: 6px;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+        .quickopen-list {{
+            background: transparent;
+        }}
+        .quickopen-list row {{
+            border-radius: 4px;
+        }}
+        .quickopen-list row:hover, .quickopen-list row:selected {{
+            background: #313244;
+        }}
+        .quickopen-name {{
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+        .quickopen-path {{
+            color: #6c7086;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
         }}
         ",
         p = cfg.window.padding,

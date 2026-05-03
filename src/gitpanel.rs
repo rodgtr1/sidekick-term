@@ -1,5 +1,6 @@
 use crate::git;
 use gtk4::prelude::*;
+use std::rc::Rc;
 
 pub fn build() -> (gtk4::Box, gtk4::Label, gtk4::ListBox, gtk4::Button) {
     let header = gtk4::Label::new(Some("GIT CHANGES"));
@@ -38,7 +39,12 @@ pub fn update_push_button(btn: &gtk4::Button, ahead: u32) {
     }
 }
 
-pub fn populate(list: &gtk4::ListBox, files: &[git::GitFile]) {
+pub fn populate(
+    list: &gtk4::ListBox,
+    files: &[git::GitFile],
+    root: &str,
+    on_refresh: &Rc<dyn Fn()>,
+) {
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
     }
@@ -62,14 +68,14 @@ pub fn populate(list: &gtk4::ListBox, files: &[git::GitFile]) {
     if !staged.is_empty() {
         add_section_header(list, "STAGED");
         for file in &staged {
-            add_file_row(list, file, true);
+            add_file_row(list, file, true, root, on_refresh);
         }
     }
 
     if !unstaged.is_empty() {
         add_section_header(list, "UNSTAGED");
         for file in &unstaged {
-            add_file_row(list, file, false);
+            add_file_row(list, file, false, root, on_refresh);
         }
     }
 }
@@ -88,7 +94,13 @@ fn add_section_header(list: &gtk4::ListBox, text: &str) {
     list.insert(&row, -1);
 }
 
-fn add_file_row(list: &gtk4::ListBox, file: &git::GitFile, staged: bool) {
+fn add_file_row(
+    list: &gtk4::ListBox,
+    file: &git::GitFile,
+    staged: bool,
+    root: &str,
+    on_refresh: &Rc<dyn Fn()>,
+) {
     let row = gtk4::ListBoxRow::new();
     let prefix = if staged { "s:" } else { "u:" };
     row.set_widget_name(&format!("{}{}", prefix, file.rel_path));
@@ -123,5 +135,89 @@ fn add_file_row(list: &gtk4::ListBox, file: &git::GitFile, staged: bool) {
     hbox.append(&name_label);
     row.set_child(Some(&hbox));
 
+    // Right-click context menu
+    let rel_path = file.rel_path.clone();
+    let root_s = root.to_string();
+    let is_untracked = file.status == git::GitStatus::Untracked;
+    let refresh = Rc::clone(on_refresh);
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(3);
+    gesture.connect_pressed(move |gesture, _n, x, y| {
+        let Some(widget) = gesture.widget() else { return };
+        show_context_menu(&widget, x, y, staged, &rel_path, &root_s, is_untracked, &refresh);
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+    });
+    row.add_controller(gesture);
+
     list.insert(&row, -1);
+}
+
+fn show_context_menu(
+    parent: &gtk4::Widget,
+    x: f64,
+    y: f64,
+    staged: bool,
+    rel_path: &str,
+    root: &str,
+    is_untracked: bool,
+    on_refresh: &Rc<dyn Fn()>,
+) {
+    let popover = gtk4::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    popover.add_css_class("context-menu");
+
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    if staged {
+        add_menu_item(&vbox, "Unstage", &popover, {
+            let path = rel_path.to_string();
+            let root = root.to_string();
+            let refresh = Rc::clone(on_refresh);
+            move || {
+                let _ = git::unstage(&root, &path);
+                refresh();
+            }
+        });
+    } else {
+        add_menu_item(&vbox, "Stage", &popover, {
+            let path = rel_path.to_string();
+            let root = root.to_string();
+            let refresh = Rc::clone(on_refresh);
+            move || {
+                let _ = git::stage(&root, &path);
+                refresh();
+            }
+        });
+        add_menu_item(&vbox, "Discard changes", &popover, {
+            let path = rel_path.to_string();
+            let root = root.to_string();
+            let refresh = Rc::clone(on_refresh);
+            move || {
+                let _ = git::discard(&root, &path, is_untracked);
+                refresh();
+            }
+        });
+    }
+
+    popover.set_child(Some(&vbox));
+    popover.set_parent(parent);
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
+}
+
+fn add_menu_item<F: Fn() + 'static>(
+    vbox: &gtk4::Box,
+    label: &str,
+    popover: &gtk4::Popover,
+    on_click: F,
+) {
+    let btn = gtk4::Button::with_label(label);
+    btn.add_css_class("context-menu-item");
+    let popover = popover.clone();
+    btn.connect_clicked(move |_| {
+        popover.popdown();
+        on_click();
+    });
+    vbox.append(&btn);
 }

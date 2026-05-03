@@ -131,7 +131,8 @@ Changed git files open as read-only diff tabs when activated from the git panel.
 | `Alt+Right` | Focus next terminal pane |
 | `Ctrl+Shift+E` | Show file explorer panel |
 | `Ctrl+Shift+G` | Show git panel |
-| `Ctrl+Shift+S` | Show search panel |
+| `Ctrl+F` | Quick open: search file names |
+| `Ctrl+Shift+F` | Show search-in-files panel |
 | `Ctrl+Shift+R` | Show run panel |
 | `Ctrl+Shift+B` | Toggle sidebar |
 | `Ctrl+Shift+O` | Toggle embedded browser panel |
