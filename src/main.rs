@@ -457,6 +457,10 @@ fn build_ui(app: &Application) {
         let last_cwd_qo = Rc::clone(&last_cwd);
         let cfg_qo = Rc::clone(&cfg);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
+            // Let WebView handle all key events itself — its IME/input breaks under Capture
+            if gtk4::prelude::GtkWindowExt::focus(&win).map(|f| f.is::<webkit6::WebView>()).unwrap_or(false) {
+                return glib::Propagation::Proceed;
+            }
             let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
             let alt = mods.contains(gdk::ModifierType::ALT_MASK);
