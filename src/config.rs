@@ -10,6 +10,7 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub window: WindowConfig,
     pub behavior: BehaviorConfig,
+    pub editor: EditorConfig,
     pub tasks: Vec<crate::runpanel::Task>,
 }
 
@@ -51,6 +52,12 @@ pub struct BehaviorConfig {
     pub allow_hyperlinks: bool,
     pub mouse_autohide: bool,
     pub audible_bell: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct EditorConfig {
+    pub word_wrap: bool,
 }
 
 impl Default for ThemeConfig {
@@ -100,6 +107,12 @@ impl Default for BehaviorConfig {
     }
 }
 
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self { word_wrap: true }
+    }
+}
+
 const DEFAULT_CONFIG: &str = r#"[theme]
 # Available themes: catppuccin-mocha
 name = "catppuccin-mocha"
@@ -135,6 +148,10 @@ allow_hyperlinks = true
 # Hide mouse cursor while typing
 mouse_autohide = true
 audible_bell = false
+
+[editor]
+# Wrap long lines in the editor (true = word wrap, false = horizontal scroll)
+word_wrap = true
 
 # Global run-panel tasks (available in every project)
 # [[tasks]]

@@ -86,7 +86,7 @@ pub fn populate(list: &gtk4::ListBox, files: &[FileMatches]) {
         // Individual match rows
         for (line_num, text) in &file.lines {
             let match_row = gtk4::ListBoxRow::new();
-            match_row.set_widget_name(&format!("{}:{}", file.abs_path, line_num));
+            match_row.set_widget_name(&file.abs_path);
 
             let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
             hbox.set_margin_start(20);

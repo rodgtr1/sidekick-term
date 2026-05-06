@@ -152,6 +152,15 @@ fn add_file_row(
     list.insert(&row, -1);
 }
 
+fn show_git_error(widget: &gtk4::Widget, msg: &str) {
+    let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    gtk4::AlertDialog::builder()
+        .message("Git operation failed")
+        .detail(msg)
+        .build()
+        .show(window.as_ref());
+}
+
 fn show_context_menu(
     parent: &gtk4::Widget,
     x: f64,
@@ -174,9 +183,10 @@ fn show_context_menu(
             let path = rel_path.to_string();
             let root = root.to_string();
             let refresh = Rc::clone(on_refresh);
-            move || {
-                let _ = git::unstage(&root, &path);
-                refresh();
+            let parent_w = parent.clone();
+            move || match git::unstage(&root, &path) {
+                Ok(()) => refresh(),
+                Err(e) => show_git_error(&parent_w, &e),
             }
         });
     } else {
@@ -184,18 +194,20 @@ fn show_context_menu(
             let path = rel_path.to_string();
             let root = root.to_string();
             let refresh = Rc::clone(on_refresh);
-            move || {
-                let _ = git::stage(&root, &path);
-                refresh();
+            let parent_w = parent.clone();
+            move || match git::stage(&root, &path) {
+                Ok(()) => refresh(),
+                Err(e) => show_git_error(&parent_w, &e),
             }
         });
         add_menu_item(&vbox, "Discard changes", &popover, {
             let path = rel_path.to_string();
             let root = root.to_string();
             let refresh = Rc::clone(on_refresh);
-            move || {
-                let _ = git::discard(&root, &path, is_untracked);
-                refresh();
+            let parent_w = parent.clone();
+            move || match git::discard(&root, &path, is_untracked) {
+                Ok(()) => refresh(),
+                Err(e) => show_git_error(&parent_w, &e),
             }
         });
     }

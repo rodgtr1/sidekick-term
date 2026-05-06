@@ -49,22 +49,37 @@ pub fn show(
     let (search_tx, search_rx) =
         async_channel::unbounded::<(u64, Vec<(String, String)>)>();
     let gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
 
-    // Search on every keystroke
+    // Search on every keystroke with 150ms debounce to avoid a thread-per-keypress
     {
         let root_s = root.to_string();
         let gen_c = Rc::clone(&gen);
         let tx = search_tx.clone();
+        let debounce_c = Rc::clone(&debounce);
         entry.connect_changed(move |e| {
             let query = e.text().to_string();
             let root = root_s.clone();
             let g = gen_c.get() + 1;
             gen_c.set(g);
             let tx = tx.clone();
-            std::thread::spawn(move || {
-                let results = search_files(&root, &query);
-                let _ = tx.send_blocking((g, results));
-            });
+
+            if let Some(id) = debounce_c.take() {
+                id.remove();
+            }
+
+            let debounce_inner = Rc::clone(&debounce_c);
+            let id = glib::timeout_add_local_once(
+                std::time::Duration::from_millis(150),
+                move || {
+                    debounce_inner.set(None);
+                    std::thread::spawn(move || {
+                        let results = search_files(&root, &query);
+                        let _ = tx.send_blocking((g, results));
+                    });
+                },
+            );
+            debounce_c.set(Some(id));
         });
     }
 
@@ -180,7 +195,7 @@ fn search_files(root: &str, query: &str) -> Vec<(String, String)> {
 
     // Try fd first
     let out = std::process::Command::new("fd")
-        .args(["--type", "f", "--max-results", &max, "--color", "never", query])
+        .args(["--type", "f", "--max-results", &max, "--color", "never", "--", query])
         .current_dir(root)
         .output();
 

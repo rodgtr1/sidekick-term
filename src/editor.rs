@@ -3,7 +3,7 @@ use sourceview5::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
-pub fn open(path: &str, notebook: &gtk4::Notebook, _cfg: &crate::config::Config) {
+pub fn open(path: &str, notebook: &gtk4::Notebook, cfg: &crate::config::Config) {
     let filename = crate::limits::display_name(path);
 
     let content =
@@ -45,6 +45,11 @@ pub fn open(path: &str, notebook: &gtk4::Notebook, _cfg: &crate::config::Config)
     view.set_insert_spaces_instead_of_tabs(true);
     view.set_auto_indent(true);
     view.set_monospace(true);
+    view.set_wrap_mode(if cfg.editor.word_wrap {
+        gtk4::WrapMode::Word
+    } else {
+        gtk4::WrapMode::None
+    });
     view.set_left_margin(12);
     view.set_right_margin(12);
     view.set_top_margin(8);

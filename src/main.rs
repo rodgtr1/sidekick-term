@@ -404,10 +404,9 @@ fn build_ui(app: &Application) {
         let nb_c = notebook.clone();
         let cfg_c = Rc::clone(&cfg);
         search_list.connect_row_activated(move |_, row| {
-            let name = row.widget_name().to_string();
-            // widget name is "abs_path:line"
-            if let Some(path) = name.splitn(2, ':').next() {
-                editor::open(path, &nb_c, &cfg_c);
+            let path = row.widget_name().to_string();
+            if !path.is_empty() {
+                editor::open(&path, &nb_c, &cfg_c);
             }
         });
     }
