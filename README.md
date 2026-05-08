@@ -136,6 +136,7 @@ Changed git files open as read-only diff tabs when activated from the git panel.
 | `Ctrl+Shift+R` | Show run panel |
 | `Ctrl+Shift+B` | Toggle sidebar |
 | `Ctrl+Shift+O` | Toggle embedded browser panel |
+| `Ctrl+,` | Open sidekick config in `nvim` |
 | `Ctrl+S` | Save the current editor tab |
 
 ## Configuration
@@ -181,7 +182,31 @@ audible_bell = false
 ## Shell Integration
 
 Shell integration enables the red notification dot on background tabs when a
-command finishes and the shell returns to the prompt.
+command finishes and the shell returns to the prompt. It also provides an agent
+status helper for tab dots:
+
+```bash
+sidekick_agent_status busy   # yellow: agent is working
+sidekick_agent_status ready  # green: agent is waiting on user input/approval
+sidekick_agent_status done   # blue: agent finished
+sidekick_agent_status idle   # clear the agent dot
+```
+
+Agent hooks can use `sidekick-agent-status` for the same statuses. The command
+writes directly to the current terminal, so it works even when hook stdout is
+captured by the agent.
+
+From a fresh clone, install the status helper and merge Claude/Codex hook config:
+
+```bash
+scripts/install-agent-status-hooks
+```
+
+The installer builds `sidekick-agent-status`, installs it to `~/.local/bin`, and
+adds hooks to `~/.claude/settings.json` and `~/.codex/config.toml`. Restart any
+open Claude Code or Codex sessions after running it. The exact config snippets
+are also available in `examples/claude/settings.json` and
+`examples/codex/config.toml`.
 
 For zsh:
 
@@ -229,6 +254,59 @@ chmod +x ~/.claude/hooks/PreToolUse/sidekick-hook
 ```
 
 If sidekick is not running, the hook allows edits to proceed normally.
+
+Claude Code can also drive tab status dots using hooks. Add these hooks alongside
+any existing hooks:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sidekick-agent-status busy" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sidekick-agent-status ready" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sidekick-agent-status done" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+For Codex CLI, enable hooks and add the same status bridge:
+
+```toml
+[features]
+hooks = true
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "sidekick-agent-status busy"
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "sidekick-agent-status ready"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "sidekick-agent-status done"
+```
 
 ## Development
 

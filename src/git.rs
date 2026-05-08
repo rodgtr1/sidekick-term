@@ -45,7 +45,8 @@ pub struct GitFile {
 pub fn ignored_set(root: &str) -> std::collections::HashSet<String> {
     let Ok(out) = Command::new("git")
         .args([
-            "-C", root,
+            "-C",
+            root,
             "ls-files",
             "--others",
             "--ignored",
@@ -199,9 +200,10 @@ pub fn ahead_count(cwd: &str) -> u32 {
         .stderr(Stdio::null())
         .output();
     match out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0)
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -227,6 +229,27 @@ fn run_git(root: &str, args: &[&str]) -> Result<(), String> {
     full_args.extend_from_slice(args);
     let out = Command::new("git")
         .args(&full_args)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+pub fn commit(root: &str, message: &str) -> Result<(), String> {
+    if message.trim().is_empty() {
+        return Err("Commit message cannot be empty.".to_string());
+    }
+    run_git(root, &["commit", "-m", message])
+}
+
+pub fn pull(cwd: &str) -> Result<(), String> {
+    let root = repo_root(cwd).ok_or_else(|| "Not a git repository.".to_string())?;
+    let out = Command::new("git")
+        .args(["-C", &root, "pull"])
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| e.to_string())?;

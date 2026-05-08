@@ -14,15 +14,29 @@ mod searchpanel;
 mod tab;
 mod theme;
 
+use gio::prelude::*;
 use gtk4::prelude::*;
 use gtk4::{gdk, Application, ApplicationWindow, Notebook};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use vte4::prelude::*;
 use webkit6::prelude::WebViewExt as _;
 
 const APP_ID: &str = "com.travismedia.sidekick";
+const AGENT_STATUS_TERMPROP: &str = "vte.ext.sidekick.agent";
+
+#[derive(Clone, Copy, PartialEq)]
+enum AgentState {
+    Idle,
+    AutoBusy,
+    Busy,
+    Ready,
+    Done,
+}
 
 enum UiResult {
     Tree {
@@ -48,6 +62,12 @@ enum UiResult {
     Push {
         result: Result<(), String>,
     },
+    Pull {
+        result: Result<(), String>,
+    },
+    Commit {
+        result: Result<(), String>,
+    },
     SearchDone {
         gen: u64,
         results: Vec<searchpanel::FileMatches>,
@@ -61,21 +81,34 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application) {
-    let cfg = Rc::new(config::Config::load());
+    install_agent_status_termprop();
+
+    let cfg = Rc::new(RefCell::new(config::Config::load()));
 
     let ipc_rx = ipc::start();
 
     let notebook = Notebook::new();
     notebook.set_scrollable(true);
     notebook.set_show_border(false);
+    notebook.add_css_class("terminal-notebook");
 
     // File tree
     let (tree_header, tree_view, tree_store, tree_scroll) = filetree::build();
     let tree_store = Rc::new(tree_store);
 
     // Git panel
-    let (git_panel, git_list_header, git_list, push_btn) = gitpanel::build();
+    let git_panel = gitpanel::build();
+    let git_list_header = git_panel.header.clone();
+    let git_list = git_panel.list.clone();
+    let push_btn = git_panel.push_btn.clone();
+    let pull_btn = git_panel.pull_btn.clone();
+    let commit_btn = git_panel.commit_btn.clone();
+    let commit_view = git_panel.commit_view.clone();
     let git_files: Rc<RefCell<Vec<git::GitFile>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // Per-terminal agent state: key = terminal widget pointer as usize
+    let agent_map: Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     // Search panel
     let (search_panel, search_entry, search_list) = searchpanel::build();
@@ -94,7 +127,7 @@ fn build_ui(app: &Application) {
     panel_stack.set_transition_type(gtk4::StackTransitionType::None);
     panel_stack.set_hexpand(false);
     panel_stack.add_named(&files_page, Some("files"));
-    panel_stack.add_named(&git_panel, Some("git"));
+    panel_stack.add_named(&git_panel.widget, Some("git"));
     panel_stack.add_named(&search_panel, Some("search"));
     panel_stack.add_named(&run_panel, Some("run"));
 
@@ -149,6 +182,7 @@ fn build_ui(app: &Application) {
 
     // Content paned: notebook | browser
     let content_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+    content_paned.add_css_class("content-paned");
     content_paned.set_start_child(Some(&notebook));
     content_paned.set_end_child(Some(&browser_panel.widget));
     content_paned.set_shrink_start_child(false);
@@ -168,10 +202,10 @@ fn build_ui(app: &Application) {
     let sidebar_visible: Rc<Cell<bool>> = Rc::new(Cell::new(true));
     let browser_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-    add_tab(&notebook, &cfg, None);
+    add_tab(&notebook, &cfg.borrow(), None, &agent_map);
 
     let css = gtk4::CssProvider::new();
-    css.load_from_string(&build_css(&cfg));
+    css.load_from_string(&build_css(&cfg.borrow()));
     gtk4::style_context_add_provider_for_display(
         &gdk::Display::default().unwrap(),
         &css,
@@ -199,13 +233,20 @@ fn build_ui(app: &Application) {
         let tx = ui_tx.clone();
         Rc::new(move || {
             let cwd = last_cwd.borrow().clone();
-            if cwd.is_empty() { return; }
+            if cwd.is_empty() {
+                return;
+            }
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
                 let files = git::changed_files(&cwd);
                 let ahead = git::ahead_count(&cwd);
-                let _ = tx.send(UiResult::Git { cwd, root, files, ahead });
+                let _ = tx.send(UiResult::Git {
+                    cwd,
+                    root,
+                    files,
+                    ahead,
+                });
             });
         })
     };
@@ -224,6 +265,9 @@ fn build_ui(app: &Application) {
         let git_busy_c = Rc::clone(&git_busy);
         let nb_c = notebook.clone();
         let push_btn_c = push_btn.clone();
+        let pull_btn_c = pull_btn.clone();
+        let commit_btn_c = commit_btn.clone();
+        let commit_view_c = commit_view.clone();
         let win_c = window.clone();
         let search_list_c = search_list.clone();
         let search_gen_c = Rc::clone(&search_gen);
@@ -235,7 +279,12 @@ fn build_ui(app: &Application) {
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             while let Ok(result) = rx.borrow_mut().try_recv() {
                 match result {
-                    UiResult::Tree { shell_cwd, tree_root, entries, tasks } => {
+                    UiResult::Tree {
+                        shell_cwd,
+                        tree_root,
+                        entries,
+                        tasks,
+                    } => {
                         tree_busy_c.set(false);
                         if *last.borrow() == shell_cwd {
                             let name = std::path::Path::new(&tree_root)
@@ -246,14 +295,21 @@ fn build_ui(app: &Application) {
                             filetree::apply_root(&store, &tv, &entries);
                             let win_r = win_run_c.clone();
                             let nb_r = nb_run_c.clone();
-                            runpanel::populate(&run_list_c, &cfg_c.tasks, &tasks, move |cmd, run| {
-                                if let Some(term) = focused_terminal(&win_r, &nb_r) {
-                                    let mut bytes = cmd.as_bytes().to_vec();
-                                    if run { bytes.push(b'\n'); }
-                                    term.feed_child(&bytes);
-                                    term.grab_focus();
-                                }
-                            });
+                            runpanel::populate(
+                                &run_list_c,
+                                &cfg_c.borrow().tasks,
+                                &tasks,
+                                move |cmd, run| {
+                                    if let Some(term) = focused_terminal(&win_r, &nb_r) {
+                                        let mut bytes = cmd.as_bytes().to_vec();
+                                        if run {
+                                            bytes.push(b'\n');
+                                        }
+                                        term.feed_child(&bytes);
+                                        term.grab_focus();
+                                    }
+                                },
+                            );
                         }
                     }
                     UiResult::Subtree { path, entries } => {
@@ -265,7 +321,12 @@ fn build_ui(app: &Application) {
                             tv.expand_row(&store.path(&iter), false);
                         }
                     }
-                    UiResult::Git { cwd, root, files, ahead } => {
+                    UiResult::Git {
+                        cwd,
+                        root,
+                        files,
+                        ahead,
+                    } => {
                         git_busy_c.set(false);
                         if *last.borrow() == cwd {
                             let count = files.len();
@@ -277,9 +338,11 @@ fn build_ui(app: &Application) {
                                 }
                                 .as_str(),
                             );
-                            gitpanel::populate(&git_list_c, &files, &root, &refresh_git_c);
+                            let staged_count =
+                                gitpanel::populate(&git_list_c, &files, &root, &refresh_git_c);
                             *git_files_c.borrow_mut() = files;
                             gitpanel::update_push_button(&push_btn_c, ahead);
+                            gitpanel::update_commit_button(&commit_btn_c, staged_count);
                         }
                     }
                     UiResult::Diff { title, result } => match result {
@@ -290,12 +353,47 @@ fn build_ui(app: &Application) {
                     },
                     UiResult::Push { result } => match result {
                         Ok(()) => {
-                            push_btn_c.set_visible(false);
+                            push_btn_c.set_label("↑  push");
+                            push_btn_c.set_sensitive(true);
                         }
                         Err(msg) => {
                             push_btn_c.set_sensitive(true);
+                            push_btn_c.set_label("↑  push");
                             gtk4::AlertDialog::builder()
                                 .message("Push failed")
+                                .detail(&msg)
+                                .build()
+                                .show(Some(&win_c));
+                        }
+                    },
+                    UiResult::Pull { result } => match result {
+                        Ok(()) => {
+                            pull_btn_c.set_sensitive(true);
+                            pull_btn_c.set_label("↓  pull");
+                            refresh_git_c();
+                        }
+                        Err(msg) => {
+                            pull_btn_c.set_sensitive(true);
+                            pull_btn_c.set_label("↓  pull");
+                            gtk4::AlertDialog::builder()
+                                .message("Pull failed")
+                                .detail(&msg)
+                                .build()
+                                .show(Some(&win_c));
+                        }
+                    },
+                    UiResult::Commit { result } => match result {
+                        Ok(()) => {
+                            commit_btn_c.set_label("Commit staged");
+                            commit_btn_c.set_sensitive(false);
+                            commit_view_c.buffer().set_text("");
+                            refresh_git_c();
+                        }
+                        Err(msg) => {
+                            commit_btn_c.set_label("Commit staged");
+                            commit_btn_c.set_sensitive(true);
+                            gtk4::AlertDialog::builder()
+                                .message("Commit failed")
                                 .detail(&msg)
                                 .build()
                                 .show(Some(&win_c));
@@ -328,8 +426,8 @@ fn build_ui(app: &Application) {
                     let tx = tx.clone();
                     let shell_cwd = cwd.clone();
                     std::thread::spawn(move || {
-                        let tree_root = git::repo_root(&shell_cwd)
-                            .unwrap_or_else(|| shell_cwd.clone());
+                        let tree_root =
+                            git::repo_root(&shell_cwd).unwrap_or_else(|| shell_cwd.clone());
                         let entries = filetree::scan_root(&tree_root);
                         let tasks = runpanel::load_tasks(&tree_root);
                         let _ = tx.send(UiResult::Tree {
@@ -359,7 +457,12 @@ fn build_ui(app: &Application) {
                     let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
                     let files = git::changed_files(&cwd);
                     let ahead = git::ahead_count(&cwd);
-                    let _ = tx.send(UiResult::Git { cwd, root, files, ahead });
+                    let _ = tx.send(UiResult::Git {
+                        cwd,
+                        root,
+                        files,
+                        ahead,
+                    });
                 });
             }
             glib::ControlFlow::Continue
@@ -400,19 +503,108 @@ fn build_ui(app: &Application) {
     }
 
     // Open file in editor when a search result is clicked
+    let on_editor_saved: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>> = Rc::new(RefCell::new(None));
     {
         let nb_c = notebook.clone();
         let cfg_c = Rc::clone(&cfg);
+        let on_saved_ref = Rc::clone(&on_editor_saved);
         search_list.connect_row_activated(move |_, row| {
             let path = row.widget_name().to_string();
             if !path.is_empty() {
-                editor::open(&path, &nb_c, &cfg_c);
+                editor::open_with_save_callback(
+                    &path,
+                    &nb_c,
+                    &cfg_c.borrow(),
+                    on_saved_ref.borrow().as_ref().map(Rc::clone),
+                );
             }
         });
     }
 
+    let reload_config: Rc<dyn Fn()> = Rc::new({
+        let cfg = Rc::clone(&cfg);
+        let css = css.clone();
+        let root_widget: gtk4::Widget = root_box.clone().upcast();
+        let last_cwd = Rc::clone(&last_cwd);
+        let run_list = run_list.clone();
+        let win = window.clone();
+        let nb = notebook.clone();
+        move || {
+            let next = config::Config::load();
+            *cfg.borrow_mut() = next;
+
+            let cfg_ref = cfg.borrow();
+            css.load_from_string(&build_css(&cfg_ref));
+            apply_config_to_open_widgets(&root_widget, &cfg_ref);
+
+            let cwd = last_cwd.borrow().clone();
+            if !cwd.is_empty() {
+                let root = git::repo_root(&cwd).unwrap_or(cwd);
+                let local_tasks = runpanel::load_tasks(&root);
+                let win_run = win.clone();
+                let nb_run = nb.clone();
+                runpanel::populate(&run_list, &cfg_ref.tasks, &local_tasks, move |cmd, run| {
+                    if let Some(term) = focused_terminal(&win_run, &nb_run) {
+                        let mut bytes = cmd.as_bytes().to_vec();
+                        if run {
+                            bytes.push(b'\n');
+                        }
+                        term.feed_child(&bytes);
+                        term.grab_focus();
+                    }
+                });
+            }
+        }
+    });
+
+    {
+        let config_path = config::config_path();
+        let reload_config = Rc::clone(&reload_config);
+        *on_editor_saved.borrow_mut() = Some(Rc::new(move |path| {
+            if std::path::Path::new(path) == config_path.as_path() {
+                reload_config();
+            }
+        }));
+    }
+    {
+        let config_file = gio::File::for_path(config::config_path());
+        match config_file.monitor_file(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>) {
+            Ok(config_monitor) => {
+                let reload_config = Rc::clone(&reload_config);
+                let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+                config_monitor.connect_changed(move |_, _, _, _| {
+                    if let Some(id) = debounce.borrow_mut().take() {
+                        id.remove();
+                    }
+
+                    let reload_config = Rc::clone(&reload_config);
+                    let debounce_c = Rc::clone(&debounce);
+                    let id = glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(150),
+                        move || {
+                            *debounce_c.borrow_mut() = None;
+                            reload_config();
+                        },
+                    );
+                    *debounce.borrow_mut() = Some(id);
+                });
+
+                let monitor_keepalive = config_monitor.clone();
+                window.connect_destroy(move |_| {
+                    monitor_keepalive.cancel();
+                });
+            }
+            Err(e) => eprintln!("sidekick: config monitor failed: {e}"),
+        }
+    }
+
     // Shared panel-switching logic for both activity bar buttons and keyboard shortcuts.
-    let all_btns = [btn_files.clone(), btn_git.clone(), btn_search.clone(), btn_run.clone()];
+    let all_btns = [
+        btn_files.clone(),
+        btn_git.clone(),
+        btn_search.clone(),
+        btn_run.clone(),
+    ];
     let switch_panel: Rc<dyn Fn(&'static str, usize)> = Rc::new({
         let stack = panel_stack.clone();
         let sidebar = tree_sidebar.clone();
@@ -455,9 +647,14 @@ fn build_ui(app: &Application) {
         let cpaned = content_paned.clone();
         let last_cwd_qo = Rc::clone(&last_cwd);
         let cfg_qo = Rc::clone(&cfg);
+        let agent_map_kb = Rc::clone(&agent_map);
+        let on_saved_k = Rc::clone(&on_editor_saved);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
             // Let WebView handle all key events itself — its IME/input breaks under Capture
-            if gtk4::prelude::GtkWindowExt::focus(&win).map(|f| f.is::<webkit6::WebView>()).unwrap_or(false) {
+            if gtk4::prelude::GtkWindowExt::focus(&win)
+                .map(|f| f.is::<webkit6::WebView>())
+                .unwrap_or(false)
+            {
                 return glib::Propagation::Proceed;
             }
             let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
@@ -468,7 +665,7 @@ fn build_ui(app: &Application) {
                 // New tab
                 (true, true, false, gdk::Key::t | gdk::Key::T) => {
                     let cwd = focused_terminal_cwd(&win, &nb);
-                    add_tab(&nb, &cfg, cwd.as_deref());
+                    add_tab(&nb, &cfg.borrow(), cwd.as_deref(), &agent_map_kb);
                     glib::Propagation::Stop
                 }
                 // Close pane / tab (also closes editor tabs)
@@ -491,12 +688,12 @@ fn build_ui(app: &Application) {
                 }
                 // Split right (side by side)
                 (true, true, false, gdk::Key::d | gdk::Key::D) => {
-                    pane::split(&win, &nb, &cfg, gtk4::Orientation::Horizontal);
+                    pane::split(&win, &nb, &cfg.borrow(), gtk4::Orientation::Horizontal);
                     glib::Propagation::Stop
                 }
                 // Split down (top / bottom)
                 (true, true, false, gdk::Key::x | gdk::Key::X) => {
-                    pane::split(&win, &nb, &cfg, gtk4::Orientation::Vertical);
+                    pane::split(&win, &nb, &cfg.borrow(), gtk4::Orientation::Vertical);
                     glib::Propagation::Stop
                 }
                 // Panel shortcuts
@@ -511,7 +708,9 @@ fn build_ui(app: &Application) {
                 (true, true, false, gdk::Key::f | gdk::Key::F) => {
                     switch_panel("search", 2);
                     let e = search_entry_k.clone();
-                    glib::idle_add_local_once(move || { e.grab_focus(); });
+                    glib::idle_add_local_once(move || {
+                        e.grab_focus();
+                    });
                     glib::Propagation::Stop
                 }
                 // Quick open: file name search
@@ -519,8 +718,15 @@ fn build_ui(app: &Application) {
                     let cwd = last_cwd_qo.borrow().clone();
                     if !cwd.is_empty() {
                         let root = git::repo_root(&cwd).unwrap_or(cwd);
-                        quickopen::show(&root, &win, &nb, &cfg_qo);
+                        if let Some(on_saved) = on_saved_k.borrow().as_ref() {
+                            quickopen::show(&root, &win, &nb, &cfg_qo, Rc::clone(on_saved));
+                        }
                     }
+                    glib::Propagation::Stop
+                }
+                // Open sidekick config
+                (true, false, false, gdk::Key::comma) => {
+                    open_config_in_nvim(&nb, &cfg.borrow(), &agent_map_kb);
                     glib::Propagation::Stop
                 }
                 (true, true, false, gdk::Key::r | gdk::Key::R) => {
@@ -588,12 +794,18 @@ fn build_ui(app: &Application) {
         let store = Rc::clone(&tree_store);
         let nb_editor = notebook.clone();
         let cfg_editor = Rc::clone(&cfg);
+        let on_saved_ref = Rc::clone(&on_editor_saved);
         #[allow(deprecated)]
         tree_view.connect_row_activated(move |_tv, path, _col| {
             if let Some(iter) = filetree::iter_for_path(&store, path) {
                 let (file_path, is_dir) = filetree::row_info(&store, &iter);
                 if !is_dir {
-                    editor::open(&file_path, &nb_editor, &cfg_editor);
+                    editor::open_with_save_callback(
+                        &file_path,
+                        &nb_editor,
+                        &cfg_editor.borrow(),
+                        on_saved_ref.borrow().as_ref().map(Rc::clone),
+                    );
                 }
             }
         });
@@ -613,13 +825,16 @@ fn build_ui(app: &Application) {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     let entries = filetree::scan_subtree(&file_path);
-                    let _ = tx.send(UiResult::Subtree { path: file_path, entries });
+                    let _ = tx.send(UiResult::Subtree {
+                        path: file_path,
+                        entries,
+                    });
                 });
             }
         });
     }
 
-    // Push button: run git push in background thread
+    // Push button
     {
         let last_cwd_c = Rc::clone(&last_cwd);
         let tx = ui_tx.clone();
@@ -635,19 +850,66 @@ fn build_ui(app: &Application) {
         });
     }
 
+    // Pull button
+    {
+        let last_cwd_c = Rc::clone(&last_cwd);
+        let tx = ui_tx.clone();
+        pull_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            btn.set_label("pulling…");
+            let cwd = last_cwd_c.borrow().clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = git::pull(&cwd);
+                let _ = tx.send(UiResult::Pull { result });
+            });
+        });
+    }
+
+    // Commit button
+    {
+        let last_cwd_c = Rc::clone(&last_cwd);
+        let tx = ui_tx.clone();
+        let commit_view_cb = commit_view.clone();
+        commit_btn.connect_clicked(move |btn| {
+            let buf = commit_view_cb.buffer();
+            let message = buf
+                .text(&buf.start_iter(), &buf.end_iter(), false)
+                .to_string();
+            if message.trim().is_empty() {
+                return;
+            }
+            btn.set_sensitive(false);
+            btn.set_label("committing…");
+            let cwd = last_cwd_c.borrow().clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = git::repo_root(&cwd)
+                    .ok_or_else(|| "Not a git repository.".to_string())
+                    .and_then(|root| git::commit(&root, &message));
+                let _ = tx.send(UiResult::Commit { result });
+            });
+        });
+    }
+
     for (idx, (btn, page)) in [
         (btn_files.clone(), "files"),
-        (btn_git.clone(),   "git"),
-        (btn_search.clone(),"search"),
-        (btn_run.clone(),   "run"),
-    ].into_iter().enumerate() {
+        (btn_git.clone(), "git"),
+        (btn_search.clone(), "search"),
+        (btn_run.clone(), "run"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let sp = Rc::clone(&switch_panel);
         let entry_c = (page == "search").then(|| search_entry.clone());
         btn.connect_clicked(move |_| {
             sp(page, idx);
             if let Some(e) = &entry_c {
                 let e = e.clone();
-                glib::idle_add_local_once(move || { e.grab_focus(); });
+                glib::idle_add_local_once(move || {
+                    e.grab_focus();
+                });
             }
         });
     }
@@ -677,6 +939,8 @@ fn build_ui(app: &Application) {
     {
         let nb = notebook.clone();
         let cfg = Rc::clone(&cfg);
+        let win_ipc = window.clone();
+        let agent_map_ipc = Rc::clone(&agent_map);
         glib::MainContext::default().spawn_local(async move {
             while let Ok(req) = ipc_rx.recv().await {
                 let resp = match req.command {
@@ -686,7 +950,7 @@ fn build_ui(app: &Application) {
                         accepted: None,
                     },
                     ipc::Command::NewTab => {
-                        add_tab(&nb, &cfg, None);
+                        add_tab(&nb, &cfg.borrow(), None, &agent_map_ipc);
                         ipc::Response {
                             ok: true,
                             error: None,
@@ -707,6 +971,38 @@ fn build_ui(app: &Application) {
                             accepted: Some(accepted),
                         }
                     }
+                    ipc::Command::AgentBusy => {
+                        set_agent_state(&win_ipc, &nb, &agent_map_ipc, AgentState::Busy);
+                        ipc::Response {
+                            ok: true,
+                            error: None,
+                            accepted: None,
+                        }
+                    }
+                    ipc::Command::AgentReady => {
+                        set_agent_state(&win_ipc, &nb, &agent_map_ipc, AgentState::Ready);
+                        ipc::Response {
+                            ok: true,
+                            error: None,
+                            accepted: None,
+                        }
+                    }
+                    ipc::Command::AgentDone => {
+                        set_agent_state(&win_ipc, &nb, &agent_map_ipc, AgentState::Done);
+                        ipc::Response {
+                            ok: true,
+                            error: None,
+                            accepted: None,
+                        }
+                    }
+                    ipc::Command::AgentIdle => {
+                        set_agent_state(&win_ipc, &nb, &agent_map_ipc, AgentState::Idle);
+                        ipc::Response {
+                            ok: true,
+                            error: None,
+                            accepted: None,
+                        }
+                    }
                 };
                 let _ = req.reply.send(resp);
             }
@@ -714,11 +1010,39 @@ fn build_ui(app: &Application) {
     }
 
     window.present();
+    {
+        let window = window.clone();
+        glib::idle_add_local_once(move || {
+            allow_window_transparency(&window);
+        });
+    }
 }
 
-fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
+fn add_tab(
+    notebook: &Notebook,
+    cfg: &config::Config,
+    cwd: Option<&str>,
+    agent_map: &Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>>,
+) {
+    add_tab_with_command(notebook, cfg, cwd, agent_map, None);
+}
+
+fn add_tab_with_command(
+    notebook: &Notebook,
+    cfg: &config::Config,
+    cwd: Option<&str>,
+    agent_map: &Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>>,
+    startup_command: Option<String>,
+) {
     let terminal = tab::build(cfg);
     let page_idx = notebook.n_pages();
+
+    // Register per-terminal agent state
+    let agent_state = Rc::new(Cell::new(AgentState::Idle));
+    let agent_key = terminal.as_ptr() as usize;
+    agent_map
+        .borrow_mut()
+        .insert(agent_key, Rc::clone(&agent_state));
 
     let label = gtk4::Label::new(Some("  ~  "));
     notebook.append_page(&terminal, Some(&label));
@@ -732,6 +1056,7 @@ fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let pid_cell: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let pid_for_spawn = Rc::clone(&pid_cell);
+    let term_for_spawn = terminal.clone();
 
     terminal.spawn_async(
         vte4::PtyFlags::DEFAULT,
@@ -745,18 +1070,31 @@ fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
         move |result| {
             if let Ok(pid) = result {
                 pid_for_spawn.set(pid.0);
+                if let Some(command) = &startup_command {
+                    let mut bytes = command.as_bytes().to_vec();
+                    bytes.push(b'\n');
+                    term_for_spawn.feed_child(&bytes);
+                }
             }
         },
     );
 
     // Notification ring: mark tab dirty when shell returns to prompt in a background tab.
-    // Requires shell integration to emit OSC 133;A (see shell-integration.zsh).
+    // Requires shell integration to emit VTE termprops (see shell-integration.zsh).
     let dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let last_terminal_change: Rc<RefCell<Instant>> = Rc::new(RefCell::new(Instant::now()));
+    let last_user_input: Rc<RefCell<Instant>> =
+        Rc::new(RefCell::new(Instant::now() - Duration::from_secs(10)));
+    let running_pulse: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     {
         let dirty_c = Rc::clone(&dirty);
+        let agent_c = Rc::clone(&agent_state);
         let nb_c = notebook.clone();
         let term_c = terminal.clone();
         terminal.connect_termprop_changed(Some("vte.shell.precmd"), move |_, _| {
+            if matches!(agent_c.get(), AgentState::AutoBusy | AgentState::Busy) {
+                agent_c.set(AgentState::Done);
+            }
             if dirty_c.get() {
                 return;
             }
@@ -768,15 +1106,69 @@ fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
             }
         });
     }
+    {
+        let agent_c = Rc::clone(&agent_state);
+        let last_user_input_c = Rc::clone(&last_user_input);
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            *last_user_input_c.borrow_mut() = Instant::now();
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
+                && matches!(agent_c.get(), AgentState::Ready)
+            {
+                agent_c.set(AgentState::AutoBusy);
+            }
+            glib::Propagation::Proceed
+        });
+        terminal.add_controller(key_ctrl);
+    }
+    {
+        let agent_c = Rc::clone(&agent_state);
+        terminal.connect_termprop_changed(Some("vte.shell.preexec"), move |_, _| {
+            if matches!(
+                agent_c.get(),
+                AgentState::Idle | AgentState::Ready | AgentState::Done
+            ) {
+                agent_c.set(AgentState::AutoBusy);
+            }
+        });
+    }
+    {
+        let agent_c = Rc::clone(&agent_state);
+        terminal.connect_termprop_changed(Some(AGENT_STATUS_TERMPROP), move |term, _| {
+            let (value, _) = term.termprop_string(AGENT_STATUS_TERMPROP);
+            if let Some(state) = value
+                .as_ref()
+                .and_then(|value| agent_state_from_status(value.as_str()))
+            {
+                agent_c.set(state);
+            }
+        });
+    }
+    {
+        let last_terminal_change_c = Rc::clone(&last_terminal_change);
+        let last_user_input_c = Rc::clone(&last_user_input);
+        let agent_c = Rc::clone(&agent_state);
+        terminal.connect_contents_changed(move |_| {
+            *last_terminal_change_c.borrow_mut() = Instant::now();
+            if matches!(agent_c.get(), AgentState::Ready)
+                && last_user_input_c.borrow().elapsed() >= Duration::from_millis(500)
+            {
+                agent_c.set(AgentState::AutoBusy);
+            }
+        });
+    }
 
-    // Poll cwd + git branch every second; show ring indicator when dirty
+    // Poll cwd + git branch; show agent/dirty indicator.
     {
         let label_ref = label.clone();
         let pid_ref = Rc::clone(&pid_cell);
         let dirty_ref = Rc::clone(&dirty);
+        let agent_ref = Rc::clone(&agent_state);
+        let last_terminal_change_ref = Rc::clone(&last_terminal_change);
+        let running_pulse_ref = Rc::clone(&running_pulse);
         let nb_ref = notebook.clone();
         let term_ref = terminal.clone();
-        glib::timeout_add_seconds_local(1, move || {
+        glib::timeout_add_local(Duration::from_millis(500), move || {
             let pid = pid_ref.get();
             if pid <= 0 {
                 return glib::ControlFlow::Continue;
@@ -792,14 +1184,58 @@ fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
                 }
             }
 
+            // Auto-detect: any foreground process other than the shell = agent running.
+            let agent_running = terminal_has_foreground_process(&term_ref, pid);
+            match (agent_running, agent_ref.get()) {
+                (true, AgentState::Idle) => agent_ref.set(AgentState::AutoBusy),
+                (false, AgentState::AutoBusy) => agent_ref.set(AgentState::Idle),
+                _ => {}
+            }
+            if matches!(agent_ref.get(), AgentState::AutoBusy)
+                && last_terminal_change_ref.borrow().elapsed() >= Duration::from_secs(2)
+                && terminal_has_known_agent_foreground_process(&term_ref, pid)
+            {
+                agent_ref.set(AgentState::Ready);
+            }
+
             let title = tab::tab_title(pid);
-            if dirty_ref.get() {
-                label_ref.set_markup(&format!(
-                    "<span foreground=\"#f38ba8\">●</span>{}",
-                    glib::markup_escape_text(title.trim_start()),
-                ));
-            } else {
-                label_ref.set_text(&title);
+            let title_text = title.trim_start();
+            let escaped_title = glib::markup_escape_text(title_text);
+            match agent_ref.get() {
+                AgentState::AutoBusy | AgentState::Busy => {
+                    running_pulse_ref.set(!running_pulse_ref.get());
+                    let color = if running_pulse_ref.get() {
+                        "#f9e2af"
+                    } else {
+                        "#c9a96a"
+                    };
+                    label_ref.set_markup(&format!(
+                        "{}{}",
+                        tab_indicator_markup(color),
+                        escaped_title,
+                    ));
+                }
+                AgentState::Ready => label_ref.set_markup(&format!(
+                    "{}{}",
+                    tab_indicator_markup("#a6e3a1"),
+                    escaped_title,
+                )),
+                AgentState::Done => label_ref.set_markup(&format!(
+                    "{}{}",
+                    tab_indicator_markup("#89b4fa"),
+                    escaped_title,
+                )),
+                AgentState::Idle => {
+                    if dirty_ref.get() {
+                        label_ref.set_markup(&format!(
+                            "{}{}",
+                            tab_indicator_markup("#f38ba8"),
+                            escaped_title,
+                        ));
+                    } else {
+                        label_ref.set_text(title_text);
+                    }
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -807,16 +1243,29 @@ fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>) {
 
     let nb = notebook.clone();
     let weak = terminal.downgrade();
+    let agent_map_close = Rc::clone(agent_map);
     terminal.connect_child_exited(move |_, _| {
+        agent_map_close.borrow_mut().remove(&agent_key);
         if let Some(t) = weak.upgrade() {
             pane::close_terminal(&t, &nb);
         }
     });
 }
 
+fn open_config_in_nvim(
+    notebook: &Notebook,
+    cfg: &config::Config,
+    agent_map: &Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>>,
+) {
+    let path = config::config_path();
+    let cwd = path.parent().and_then(|p| p.to_str());
+    let command = format!("nvim {}", shell_quote_path(&path));
+    add_tab_with_command(notebook, cfg, cwd, agent_map, Some(command));
+}
+
 fn focused_terminal(window: &ApplicationWindow, notebook: &Notebook) -> Option<vte4::Terminal> {
-    if let Some(term) = gtk4::prelude::GtkWindowExt::focus(window)
-        .and_then(|w| w.downcast::<vte4::Terminal>().ok())
+    if let Some(term) =
+        gtk4::prelude::GtkWindowExt::focus(window).and_then(|w| w.downcast::<vte4::Terminal>().ok())
     {
         return Some(term);
     }
@@ -853,6 +1302,144 @@ fn notebook_page_of(widget: &gtk4::Widget, notebook: &Notebook) -> Option<gtk4::
     }
 }
 
+fn set_agent_state(
+    window: &ApplicationWindow,
+    notebook: &Notebook,
+    agent_map: &Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>>,
+    state: AgentState,
+) {
+    // Try focused terminal first; fall back to updating all registered terminals.
+    if let Some(term) = focused_terminal(window, notebook) {
+        let key = term.as_ptr() as usize;
+        if let Some(agent_state) = agent_map.borrow().get(&key) {
+            agent_state.set(state);
+            return;
+        }
+    }
+    for agent_state in agent_map.borrow().values() {
+        agent_state.set(state);
+    }
+}
+
+/// Returns true if the terminal has a foreground process other than the shell itself.
+fn terminal_has_foreground_process(terminal: &vte4::Terminal, shell_pid: i32) -> bool {
+    let Some(foreground_pgid) = terminal_foreground_pgid(terminal) else {
+        return false;
+    };
+    let shell_pgid = unsafe { libc::getpgid(shell_pid) };
+    shell_pgid > 0 && foreground_pgid != shell_pgid
+}
+
+fn terminal_has_known_agent_foreground_process(terminal: &vte4::Terminal, shell_pid: i32) -> bool {
+    let Some(foreground_pgid) = terminal_foreground_pgid(terminal) else {
+        return false;
+    };
+    let shell_pgid = unsafe { libc::getpgid(shell_pid) };
+    if shell_pgid <= 0 || foreground_pgid == shell_pgid {
+        return false;
+    }
+
+    foreground_process_command(foreground_pgid)
+        .map(|command| is_known_agent_command(&command))
+        .unwrap_or(false)
+}
+
+fn terminal_foreground_pgid(terminal: &vte4::Terminal) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    let pty = terminal.pty()?;
+    let foreground_pgid = unsafe { libc::tcgetpgrp(pty.fd().as_raw_fd()) };
+    if foreground_pgid <= 0 {
+        return None;
+    }
+    Some(foreground_pgid)
+}
+
+fn foreground_process_command(pid: i32) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if !cmdline.is_empty() {
+        let command = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !command.is_empty() {
+            return Some(command);
+        }
+    }
+
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty())
+}
+
+fn is_known_agent_command(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    command.contains("claude") || command.contains("codex")
+}
+
+fn tab_indicator_markup(color: &str) -> String {
+    format!("<span foreground=\"{}\" size=\"small\">●</span> ", color)
+}
+
+fn agent_state_from_status(status: &str) -> Option<AgentState> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "busy" | "working" | "running" => Some(AgentState::Busy),
+        "ready" | "prompt" | "waiting" | "needs-user" | "needs_user" => Some(AgentState::Ready),
+        "done" | "finished" | "complete" => Some(AgentState::Done),
+        "idle" | "clear" | "reset" => Some(AgentState::Idle),
+        _ => None,
+    }
+}
+
+fn install_agent_status_termprop() {
+    let Ok(name) = CString::new(AGENT_STATUS_TERMPROP) else {
+        return;
+    };
+    unsafe {
+        vte4::ffi::vte_install_termprop(
+            name.as_ptr(),
+            vte4::ffi::VTE_PROPERTY_STRING,
+            vte4::ffi::VTE_PROPERTY_FLAG_NONE,
+        );
+    }
+}
+
+fn allow_window_transparency(window: &ApplicationWindow) {
+    if let Some(native) = window.native() {
+        if let Some(surface) = native.surface() {
+            surface.set_opaque_region(None);
+        }
+    }
+}
+
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn apply_config_to_open_widgets(widget: &gtk4::Widget, cfg: &config::Config) {
+    if let Ok(term) = widget.clone().downcast::<vte4::Terminal>() {
+        tab::apply_config(&term, cfg);
+    }
+
+    if let Ok(view) = widget.clone().downcast::<sourceview5::View>() {
+        view.set_wrap_mode(if cfg.editor.word_wrap {
+            gtk4::WrapMode::Word
+        } else {
+            gtk4::WrapMode::None
+        });
+    }
+
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        let next = w.next_sibling();
+        apply_config_to_open_widgets(&w, cfg);
+        child = next;
+    }
+}
+
 fn build_css(cfg: &config::Config) -> String {
     let font = &cfg.font.family;
     let fsize = cfg.font.size;
@@ -862,7 +1449,17 @@ fn build_css(cfg: &config::Config) -> String {
         "
         window {{ background: transparent; }}
 
-        vte-terminal {{ padding: {p}px; }}
+        .content-paned,
+        .terminal-notebook,
+        .terminal-notebook > stack,
+        paned {{
+            background: transparent;
+        }}
+
+        vte-terminal {{
+            background: transparent;
+            padding: {p}px;
+        }}
 
         notebook header {{
             background-color: #181825;
@@ -983,8 +1580,7 @@ fn build_css(cfg: &config::Config) -> String {
             color: #a6e3a1;
             border: none;
             border-radius: 4px;
-            padding: 6px 12px;
-            margin: 6px 8px 8px 8px;
+            padding: 6px 8px;
             font-size: {sidebar_pt}pt;
             font-weight: bold;
         }}
@@ -992,6 +1588,51 @@ fn build_css(cfg: &config::Config) -> String {
             background-color: #45475a;
         }}
         .push-btn:disabled {{
+            color: #6c7086;
+        }}
+
+        .pull-btn {{
+            background-color: #313244;
+            color: #89b4fa;
+            border: none;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: {sidebar_pt}pt;
+            font-weight: bold;
+        }}
+        .pull-btn:hover {{
+            background-color: #45475a;
+        }}
+        .pull-btn:disabled {{
+            color: #6c7086;
+        }}
+
+        .commit-scroll {{
+            border: 1px solid #313244;
+            border-radius: 4px;
+        }}
+        .commit-view,
+        .commit-view text {{
+            background-color: #181825;
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+            padding: 4px 6px;
+        }}
+        .commit-btn {{
+            background-color: #cba6f7;
+            color: #1e1e2e;
+            border: none;
+            border-radius: 4px;
+            padding: 5px 12px;
+            font-size: {sidebar_pt}pt;
+            font-weight: bold;
+        }}
+        .commit-btn:hover {{
+            background-color: #d4b1ff;
+        }}
+        .commit-btn:disabled {{
+            background-color: #313244;
             color: #6c7086;
         }}
 

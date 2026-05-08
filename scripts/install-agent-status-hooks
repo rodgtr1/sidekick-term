@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bin_dir="${HOME}/.local/bin"
+status_bin="${bin_dir}/sidekick-agent-status"
+
+mkdir -p "$bin_dir"
+cargo build --release --manifest-path "$repo/Cargo.toml" --bin sidekick-agent-status
+install -m 0755 "$repo/target/release/sidekick-agent-status" "$status_bin"
+
+python3 - "$HOME/.claude/settings.json" "$status_bin" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+status_bin = sys.argv[2]
+path.parent.mkdir(parents=True, exist_ok=True)
+
+if path.exists() and path.read_text().strip():
+    data = json.loads(path.read_text())
+else:
+    data = {}
+
+hooks = data.setdefault("hooks", {})
+
+def add_hook(event, status):
+    command = f"{status_bin} {status}"
+    groups = hooks.setdefault(event, [])
+    for group in groups:
+        for hook in group.get("hooks", []):
+            if hook.get("type") == "command" and hook.get("command") == command:
+                return
+    groups.append({"hooks": [{"type": "command", "command": command}]})
+
+add_hook("UserPromptSubmit", "busy")
+add_hook("PermissionRequest", "ready")
+add_hook("Stop", "done")
+
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+
+python3 - "$HOME/.codex/config.toml" "$status_bin" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+status_bin = sys.argv[2]
+path.parent.mkdir(parents=True, exist_ok=True)
+text = path.read_text() if path.exists() else ""
+
+def ensure_codex_hooks_enabled(text):
+    features = re.search(r"(?m)^\[features\]\s*$", text)
+    if not features:
+        block = "[features]\nhooks = true\n\n"
+        first_table = re.search(r"(?m)^\[\[?[^\]]+\]?\]\s*$", text)
+        if not first_table:
+            return text.rstrip() + "\n\n" + block
+        return (
+            text[: first_table.start()].rstrip()
+            + "\n\n"
+            + block
+            + text[first_table.start() :].lstrip()
+        )
+
+    next_table = re.search(r"(?m)^\[[^\]]+\]\s*$", text[features.end():])
+    section_end = len(text) if not next_table else features.end() + next_table.start()
+    section = text[features.end():section_end]
+
+    section = re.sub(r"(?m)^\s*codex_hooks\s*=.*\n?", "", section)
+    if re.search(r"(?m)^\s*hooks\s*=", section):
+        section = re.sub(r"(?m)^(\s*hooks\s*=\s*).*$", r"\1true", section)
+    else:
+        section = "\nhooks = true" + section
+
+    return text[:features.end()] + section + text[section_end:]
+
+text = ensure_codex_hooks_enabled(text)
+
+if "sidekick-agent-status busy" not in text:
+    commands = {
+        "UserPromptSubmit": f"{status_bin} busy",
+        "PermissionRequest": f"{status_bin} ready",
+        "Stop": f"{status_bin} done",
+    }
+    block = ["", "# sidekick agent status hooks"]
+    for event, command in commands.items():
+        block.extend([
+            f"[[hooks.{event}]]",
+            f"[[hooks.{event}.hooks]]",
+            'type = "command"',
+            f"command = {json.dumps(command)}",
+            "",
+        ])
+    text = text.rstrip() + "\n" + "\n".join(block)
+
+path.write_text(text)
+PY
+
+cat <<EOF
+Installed sidekick-agent-status to:
+  $status_bin
+
+Updated:
+  $HOME/.claude/settings.json
+  $HOME/.codex/config.toml
+
+Restart Claude Code/Codex sessions for hook changes to take effect.
+EOF

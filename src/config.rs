@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 #[serde(default)]
 pub struct Config {
     pub theme: ThemeConfig,
@@ -14,14 +14,14 @@ pub struct Config {
     pub tasks: Vec<crate::runpanel::Task>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct ThemeConfig {
     pub name: String,
     pub opacity: f32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct FontConfig {
     pub family: String,
@@ -29,7 +29,7 @@ pub struct FontConfig {
     pub bold_is_bright: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct CursorConfig {
     // block | ibeam | underline
@@ -37,13 +37,13 @@ pub struct CursorConfig {
     pub blink: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct WindowConfig {
     pub padding: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct BehaviorConfig {
     pub scrollback_lines: i64,
@@ -54,7 +54,7 @@ pub struct BehaviorConfig {
     pub audible_bell: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct EditorConfig {
     pub word_wrap: bool,
@@ -180,7 +180,7 @@ impl Config {
     }
 }
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     let config_dir = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

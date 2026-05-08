@@ -3,7 +3,12 @@ use sourceview5::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
-pub fn open(path: &str, notebook: &gtk4::Notebook, cfg: &crate::config::Config) {
+pub fn open_with_save_callback(
+    path: &str,
+    notebook: &gtk4::Notebook,
+    cfg: &crate::config::Config,
+    on_saved: Option<Rc<dyn Fn(&str)>>,
+) {
     let filename = crate::limits::display_name(path);
 
     let content =
@@ -94,6 +99,7 @@ pub fn open(path: &str, notebook: &gtk4::Notebook, cfg: &crate::config::Config) 
     {
         let buf = buffer.clone();
         let path_s = path.to_string();
+        let on_saved = on_saved.clone();
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
             let ctrl = mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
             if ctrl && (key == gtk4::gdk::Key::s || key == gtk4::gdk::Key::S) {
@@ -103,6 +109,9 @@ pub fn open(path: &str, notebook: &gtk4::Notebook, cfg: &crate::config::Config) 
                     eprintln!("sidekick: save failed: {e}");
                 } else {
                     buf.set_modified(false);
+                    if let Some(on_saved) = &on_saved {
+                        on_saved(&path_s);
+                    }
                 }
                 return glib::Propagation::Stop;
             }

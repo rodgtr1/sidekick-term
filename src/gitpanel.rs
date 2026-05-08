@@ -2,7 +2,17 @@ use crate::git;
 use gtk4::prelude::*;
 use std::rc::Rc;
 
-pub fn build() -> (gtk4::Box, gtk4::Label, gtk4::ListBox, gtk4::Button) {
+pub struct GitPanel {
+    pub widget: gtk4::Box,
+    pub header: gtk4::Label,
+    pub list: gtk4::ListBox,
+    pub push_btn: gtk4::Button,
+    pub pull_btn: gtk4::Button,
+    pub commit_view: gtk4::TextView,
+    pub commit_btn: gtk4::Button,
+}
+
+pub fn build() -> GitPanel {
     let header = gtk4::Label::new(Some("GIT CHANGES"));
     header.set_xalign(0.0);
     header.add_css_class("sidebar-header");
@@ -11,40 +21,90 @@ pub fn build() -> (gtk4::Box, gtk4::Label, gtk4::ListBox, gtk4::Button) {
     list.set_selection_mode(gtk4::SelectionMode::Single);
     list.add_css_class("file-tree");
 
-    let scroll = gtk4::ScrolledWindow::new();
-    scroll.set_child(Some(&list));
-    scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    scroll.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
-    scroll.set_vexpand(true);
+    let list_scroll = gtk4::ScrolledWindow::new();
+    list_scroll.set_child(Some(&list));
+    list_scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    list_scroll.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
+    list_scroll.set_vexpand(true);
+
+    // Commit message area
+    let commit_view = gtk4::TextView::new();
+    commit_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+    commit_view.set_accepts_tab(false);
+    commit_view.add_css_class("commit-view");
+
+    let commit_scroll = gtk4::ScrolledWindow::new();
+    commit_scroll.set_child(Some(&commit_view));
+    commit_scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    commit_scroll.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
+    commit_scroll.set_height_request(64);
+    commit_scroll.set_margin_start(8);
+    commit_scroll.set_margin_end(8);
+    commit_scroll.set_margin_top(6);
+    commit_scroll.set_margin_bottom(0);
+    commit_scroll.add_css_class("commit-scroll");
+
+    let commit_btn = gtk4::Button::with_label("Commit staged");
+    commit_btn.add_css_class("commit-btn");
+    commit_btn.set_sensitive(false);
+    commit_btn.set_margin_start(8);
+    commit_btn.set_margin_end(8);
+    commit_btn.set_margin_top(4);
+    commit_btn.set_margin_bottom(4);
+
+    // Pull / Push row
+    let pull_btn = gtk4::Button::with_label("↓  pull");
+    pull_btn.add_css_class("pull-btn");
+    pull_btn.set_hexpand(true);
 
     let push_btn = gtk4::Button::with_label("↑  push");
     push_btn.add_css_class("push-btn");
-    push_btn.set_visible(false);
+    push_btn.set_hexpand(true);
+
+    let action_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    action_row.set_margin_start(8);
+    action_row.set_margin_end(8);
+    action_row.set_margin_bottom(8);
+    action_row.append(&pull_btn);
+    action_row.append(&push_btn);
 
     let panel = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     panel.append(&header);
-    panel.append(&scroll);
-    panel.append(&push_btn);
+    panel.append(&list_scroll);
+    panel.append(&commit_scroll);
+    panel.append(&commit_btn);
+    panel.append(&action_row);
 
-    (panel, header, list, push_btn)
+    GitPanel {
+        widget: panel,
+        header,
+        list,
+        push_btn,
+        pull_btn,
+        commit_view,
+        commit_btn,
+    }
 }
 
 pub fn update_push_button(btn: &gtk4::Button, ahead: u32) {
     if ahead == 0 {
-        btn.set_visible(false);
+        btn.set_label("↑  push");
     } else {
         btn.set_label(&format!("↑  push  {ahead}"));
-        btn.set_sensitive(true);
-        btn.set_visible(true);
     }
 }
 
+pub fn update_commit_button(btn: &gtk4::Button, staged_count: usize) {
+    btn.set_sensitive(staged_count > 0);
+}
+
+/// Returns the number of staged files.
 pub fn populate(
     list: &gtk4::ListBox,
     files: &[git::GitFile],
     root: &str,
     on_refresh: &Rc<dyn Fn()>,
-) {
+) -> usize {
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
     }
@@ -59,11 +119,12 @@ pub fn populate(
         row.set_activatable(false);
         row.set_selectable(false);
         list.insert(&row, -1);
-        return;
+        return 0;
     }
 
     let staged: Vec<_> = files.iter().filter(|f| f.staged).collect();
     let unstaged: Vec<_> = files.iter().filter(|f| !f.staged).collect();
+    let staged_count = staged.len();
 
     if !staged.is_empty() {
         add_section_header(list, "STAGED");
@@ -78,6 +139,8 @@ pub fn populate(
             add_file_row(list, file, false, root, on_refresh);
         }
     }
+
+    staged_count
 }
 
 fn add_section_header(list: &gtk4::ListBox, text: &str) {
@@ -135,7 +198,6 @@ fn add_file_row(
     hbox.append(&name_label);
     row.set_child(Some(&hbox));
 
-    // Right-click context menu
     let rel_path = file.rel_path.clone();
     let root_s = root.to_string();
     let is_untracked = file.status == git::GitStatus::Untracked;
@@ -143,8 +205,19 @@ fn add_file_row(
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(3);
     gesture.connect_pressed(move |gesture, _n, x, y| {
-        let Some(widget) = gesture.widget() else { return };
-        show_context_menu(&widget, x, y, staged, &rel_path, &root_s, is_untracked, &refresh);
+        let Some(widget) = gesture.widget() else {
+            return;
+        };
+        show_context_menu(
+            &widget,
+            x,
+            y,
+            staged,
+            &rel_path,
+            &root_s,
+            is_untracked,
+            &refresh,
+        );
         gesture.set_state(gtk4::EventSequenceState::Claimed);
     });
     row.add_controller(gesture);
@@ -153,7 +226,9 @@ fn add_file_row(
 }
 
 fn show_git_error(widget: &gtk4::Widget, msg: &str) {
-    let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let window = widget
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
     gtk4::AlertDialog::builder()
         .message("Git operation failed")
         .detail(msg)

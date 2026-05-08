@@ -1,6 +1,6 @@
-use gtk4::prelude::*;
 use gtk4::gdk;
-use std::cell::Cell;
+use gtk4::prelude::*;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const MAX_RESULTS: usize = 50;
@@ -9,7 +9,8 @@ pub fn show(
     root: &str,
     parent: &gtk4::ApplicationWindow,
     notebook: &gtk4::Notebook,
-    cfg: &Rc<crate::config::Config>,
+    cfg: &Rc<RefCell<crate::config::Config>>,
+    on_saved: Rc<dyn Fn(&str)>,
 ) {
     let win = gtk4::Window::new();
     win.set_transient_for(Some(parent));
@@ -46,8 +47,7 @@ pub fn show(
     vbox.append(&scroll);
     win.set_child(Some(&vbox));
 
-    let (search_tx, search_rx) =
-        async_channel::unbounded::<(u64, Vec<(String, String)>)>();
+    let (search_tx, search_rx) = async_channel::unbounded::<(u64, Vec<(String, String)>)>();
     let gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
 
@@ -69,16 +69,14 @@ pub fn show(
             }
 
             let debounce_inner = Rc::clone(&debounce_c);
-            let id = glib::timeout_add_local_once(
-                std::time::Duration::from_millis(150),
-                move || {
+            let id =
+                glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                     debounce_inner.set(None);
                     std::thread::spawn(move || {
                         let results = search_files(&root, &query);
                         let _ = tx.send_blocking((g, results));
                     });
-                },
-            );
+                });
             debounce_c.set(Some(id));
         });
     }
@@ -100,11 +98,17 @@ pub fn show(
     {
         let nb_c = notebook.clone();
         let cfg_c = Rc::clone(cfg);
+        let on_saved_c = Rc::clone(&on_saved);
         let win_c = win.clone();
         list.connect_row_activated(move |_, row| {
             let path = row.widget_name().to_string();
             if !path.is_empty() {
-                crate::editor::open(&path, &nb_c, &cfg_c);
+                crate::editor::open_with_save_callback(
+                    &path,
+                    &nb_c,
+                    &cfg_c.borrow(),
+                    Some(Rc::clone(&on_saved_c)),
+                );
                 win_c.close();
             }
         });
@@ -116,27 +120,25 @@ pub fn show(
         let list_c = list.clone();
         let key = gtk4::EventControllerKey::new();
         key.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        key.connect_key_pressed(move |_, keyval, _, _| {
-            match keyval {
-                gdk::Key::Escape => {
-                    win_c.close();
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Down => {
-                    if let Some(row) = list_c.row_at_index(0) {
-                        list_c.select_row(Some(&row));
-                        row.grab_focus();
-                    }
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Return => {
-                    if let Some(row) = list_c.selected_row() {
-                        row.activate();
-                    }
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
+        key.connect_key_pressed(move |_, keyval, _, _| match keyval {
+            gdk::Key::Escape => {
+                win_c.close();
+                glib::Propagation::Stop
             }
+            gdk::Key::Down => {
+                if let Some(row) = list_c.row_at_index(0) {
+                    list_c.select_row(Some(&row));
+                    row.grab_focus();
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::Return => {
+                if let Some(row) = list_c.selected_row() {
+                    row.activate();
+                }
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
         });
         win.add_controller(key);
     }
@@ -195,7 +197,16 @@ fn search_files(root: &str, query: &str) -> Vec<(String, String)> {
 
     // Try fd first
     let out = std::process::Command::new("fd")
-        .args(["--type", "f", "--max-results", &max, "--color", "never", "--", query])
+        .args([
+            "--type",
+            "f",
+            "--max-results",
+            &max,
+            "--color",
+            "never",
+            "--",
+            query,
+        ])
         .current_dir(root)
         .output();
 

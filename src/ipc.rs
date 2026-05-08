@@ -19,6 +19,10 @@ pub enum Command {
         #[serde(rename = "new")]
         new_content: String,
     },
+    AgentBusy,
+    AgentReady,
+    AgentDone,
+    AgentIdle,
 }
 
 #[derive(Serialize)]

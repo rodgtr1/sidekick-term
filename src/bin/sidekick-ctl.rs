@@ -6,8 +6,14 @@ fn main() {
     let payload = match args.get(1).map(|s| s.as_str()) {
         Some("ping") => r#"{"action":"ping"}"#,
         Some("new-tab") => r#"{"action":"new_tab"}"#,
+        Some("agent-busy") => r#"{"action":"agent_busy"}"#,
+        Some("agent-ready") => r#"{"action":"agent_ready"}"#,
+        Some("agent-done") => r#"{"action":"agent_done"}"#,
+        Some("agent-idle") => r#"{"action":"agent_idle"}"#,
         _ => {
-            eprintln!("Usage: sidekick-ctl <ping|new-tab>");
+            eprintln!(
+                "Usage: sidekick-ctl <ping|new-tab|agent-busy|agent-ready|agent-done|agent-idle>"
+            );
             std::process::exit(1);
         }
     };

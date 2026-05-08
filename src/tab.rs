@@ -16,7 +16,41 @@ const BRANCH_CACHE_TTL: Duration = Duration::from_secs(5);
 pub fn build(cfg: &Config) -> Terminal {
     let terminal = Terminal::new();
 
-    crate::theme::apply(&terminal, &cfg.theme.name, cfg.theme.opacity);
+    apply_config(&terminal, cfg);
+
+    // Register a URL regex so plain https?:// links get a pointer cursor on hover.
+    if let Ok(re) = vte4::Regex::for_match("https?://[^\\s\\])'\">\x01-\x1f]+", 0) {
+        let tag = terminal.match_add_regex(&re, 0);
+        terminal.match_set_cursor_name(tag, "pointer");
+    }
+
+    // Ctrl+click opens hyperlinks (OSC 8) and regex-matched URLs via xdg-open.
+    {
+        let term_c = terminal.clone();
+        let gesture = gtk4::GestureClick::new();
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            let mods = gesture.current_event_state();
+            if !mods.contains(gdk::ModifierType::CONTROL_MASK) {
+                return;
+            }
+            let uri = term_c
+                .check_hyperlink_at(x, y)
+                .or_else(|| term_c.check_match_at(x, y).0);
+            if let Some(uri) = uri {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(uri.as_str())
+                    .spawn();
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+            }
+        });
+        terminal.add_controller(gesture);
+    }
+
+    terminal
+}
+
+pub fn apply_config(terminal: &Terminal, cfg: &Config) {
+    crate::theme::apply(terminal, &cfg.theme.name, cfg.theme.opacity);
 
     let font_str = format!("{} {}", cfg.font.family, cfg.font.size);
     terminal.set_font(Some(&pango::FontDescription::from_string(&font_str)));
@@ -39,34 +73,6 @@ pub fn build(cfg: &Config) -> Terminal {
     terminal.set_allow_hyperlink(cfg.behavior.allow_hyperlinks);
     terminal.set_mouse_autohide(cfg.behavior.mouse_autohide);
     terminal.set_audible_bell(cfg.behavior.audible_bell);
-
-    // Register a URL regex so plain https?:// links get a pointer cursor on hover.
-    if let Ok(re) = vte4::Regex::for_match("https?://[^\\s\\])'\">\x01-\x1f]+", 0) {
-        let tag = terminal.match_add_regex(&re, 0);
-        terminal.match_set_cursor_name(tag, "pointer");
-    }
-
-    // Ctrl+click opens hyperlinks (OSC 8) and regex-matched URLs via xdg-open.
-    {
-        let term_c = terminal.clone();
-        let gesture = gtk4::GestureClick::new();
-        gesture.connect_pressed(move |gesture, _n_press, x, y| {
-            let mods = gesture.current_event_state();
-            if !mods.contains(gdk::ModifierType::CONTROL_MASK) {
-                return;
-            }
-            let uri = term_c
-                .check_hyperlink_at(x, y)
-                .or_else(|| term_c.check_match_at(x, y).0);
-            if let Some(uri) = uri {
-                let _ = std::process::Command::new("xdg-open").arg(uri.as_str()).spawn();
-                gesture.set_state(gtk4::EventSequenceState::Claimed);
-            }
-        });
-        terminal.add_controller(gesture);
-    }
-
-    terminal
 }
 
 /// Builds the tab label string from the shell's PID.
