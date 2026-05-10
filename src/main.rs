@@ -834,6 +834,48 @@ fn build_ui(app: &Application) {
         });
     }
 
+    // File tree context menu.
+    {
+        let store = Rc::clone(&tree_store);
+        let tree = tree_view.clone();
+        let refresh_git_c = Rc::clone(&refresh_git);
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(3);
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            #[allow(deprecated)]
+            let Some((Some(path), _, _, _)) = tree.path_at_pos(x as i32, y as i32) else {
+                return;
+            };
+            let Some(iter) = filetree::iter_for_path(&store, &path) else {
+                return;
+            };
+            let (file_path, is_dir) = filetree::row_info(&store, &iter);
+            if file_path.is_empty()
+                || file_path == filetree::PLACEHOLDER_PATH
+                || file_path == filetree::LOADING_PATH
+            {
+                return;
+            }
+
+            #[allow(deprecated)]
+            tree.selection().select_path(&path);
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            show_filetree_context_menu(
+                &widget,
+                &store,
+                x,
+                y,
+                file_path,
+                is_dir,
+                Rc::clone(&refresh_git_c),
+            );
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        });
+        tree_view.add_controller(gesture);
+    }
+
     // Push button
     {
         let last_cwd_c = Rc::clone(&last_cwd);
@@ -1016,6 +1058,136 @@ fn build_ui(app: &Application) {
             allow_window_transparency(&window);
         });
     }
+}
+
+#[allow(deprecated)]
+fn show_filetree_context_menu(
+    parent: &gtk4::Widget,
+    store: &Rc<gtk4::TreeStore>,
+    x: f64,
+    y: f64,
+    path: String,
+    is_dir: bool,
+    on_refresh_git: Rc<dyn Fn()>,
+) {
+    let popover = gtk4::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    popover.add_css_class("context-menu");
+
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    add_filetree_menu_item(&vbox, "Open in Folder", &popover, {
+        let path = path.clone();
+        let parent_w = parent.clone();
+        move || {
+            if let Err(e) = open_path_in_folder_app(&path, is_dir) {
+                show_filetree_error(&parent_w, "Open in Folder failed", &e);
+            }
+        }
+    });
+
+    add_filetree_menu_item(&vbox, "Move to Trash", &popover, {
+        let path = path.clone();
+        let parent_w = parent.clone();
+        let store = Rc::clone(store);
+        move || {
+            confirm_move_to_trash(
+                &parent_w,
+                &store,
+                path.clone(),
+                is_dir,
+                Rc::clone(&on_refresh_git),
+            );
+        }
+    });
+
+    popover.set_child(Some(&vbox));
+    popover.set_parent(parent);
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
+}
+
+fn add_filetree_menu_item<F: Fn() + 'static>(
+    vbox: &gtk4::Box,
+    label: &str,
+    popover: &gtk4::Popover,
+    on_click: F,
+) {
+    let btn = gtk4::Button::with_label(label);
+    btn.add_css_class("context-menu-item");
+    let popover = popover.clone();
+    btn.connect_clicked(move |_| {
+        popover.popdown();
+        on_click();
+    });
+    vbox.append(&btn);
+}
+
+fn open_path_in_folder_app(path: &str, is_dir: bool) -> Result<(), String> {
+    let path = std::path::Path::new(path);
+    let folder = if is_dir {
+        path
+    } else {
+        path.parent()
+            .ok_or_else(|| "File has no parent folder.".to_string())?
+    };
+    let uri = gio::File::for_path(folder).uri();
+    gio::AppInfo::launch_default_for_uri(uri.as_str(), None::<&gio::AppLaunchContext>)
+        .map_err(|e| e.to_string())
+}
+
+#[allow(deprecated)]
+fn confirm_move_to_trash(
+    parent: &gtk4::Widget,
+    store: &Rc<gtk4::TreeStore>,
+    path: String,
+    is_dir: bool,
+    on_refresh_git: Rc<dyn Fn()>,
+) {
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    let item_kind = if is_dir { "folder" } else { "file" };
+    let dialog = gtk4::AlertDialog::builder()
+        .message(format!("Move {item_kind} to Trash?"))
+        .detail(format!("{name}\n\n{path}"))
+        .buttons(["Cancel", "Move to Trash"])
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let parent_w = parent.clone();
+    let store = Rc::clone(store);
+    dialog.choose(window.as_ref(), None::<&gio::Cancellable>, move |choice| {
+        if choice != Ok(1) {
+            return;
+        }
+        let file = gio::File::for_path(&path);
+        match file.trash(None::<&gio::Cancellable>) {
+            Ok(()) => {
+                if let Some(iter) = filetree::find_iter_by_file_path(&store, &path) {
+                    store.remove(&iter);
+                }
+                on_refresh_git();
+            }
+            Err(e) => show_filetree_error(&parent_w, "Move to Trash failed", &e.to_string()),
+        }
+    });
+}
+
+fn show_filetree_error(parent: &gtk4::Widget, message: &str, detail: &str) {
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+    gtk4::AlertDialog::builder()
+        .message(message)
+        .detail(detail)
+        .build()
+        .show(window.as_ref());
 }
 
 fn add_tab(

@@ -9,8 +9,8 @@ pub const COL_PATH: u32 = 1;
 pub const COL_IS_DIR: u32 = 2;
 pub const COL_IGNORED: u32 = 3;
 const MAX_DEPTH: u32 = 2;
-const PLACEHOLDER_PATH: &str = "//placeholder//";
-const LOADING_PATH: &str = "//loading//";
+pub const PLACEHOLDER_PATH: &str = "//placeholder//";
+pub const LOADING_PATH: &str = "//loading//";
 
 #[derive(Clone, Debug)]
 pub struct TreeEntry {
@@ -123,10 +123,7 @@ pub fn build() -> (
                 .get::<bool>()
                 .unwrap_or(false);
             cell.set_property("text", name);
-            cell.set_property(
-                "foreground",
-                if ignored { "#45475a" } else { "#cdd6f4" },
-            );
+            cell.set_property("foreground", if ignored { "#45475a" } else { "#cdd6f4" });
         },
     );
 
@@ -159,22 +156,14 @@ pub fn scan_subtree(path: &str) -> Vec<TreeEntry> {
 /// Bulk-load entries into the store. Detaches the view during population so
 /// GTK reads the complete model state on reconnect instead of processing
 /// O(n²) incremental signals.
-pub fn apply_root(
-    store: &gtk4::TreeStore,
-    tree_view: &gtk4::TreeView,
-    entries: &[TreeEntry],
-) {
+pub fn apply_root(store: &gtk4::TreeStore, tree_view: &gtk4::TreeView, entries: &[TreeEntry]) {
     tree_view.set_model(None::<&gtk4::TreeStore>);
     store.clear();
     apply_entries(store, None, entries);
     tree_view.set_model(Some(store));
 }
 
-pub fn apply_subtree(
-    store: &gtk4::TreeStore,
-    parent: &gtk4::TreeIter,
-    entries: &[TreeEntry],
-) {
+pub fn apply_subtree(store: &gtk4::TreeStore, parent: &gtk4::TreeIter, entries: &[TreeEntry]) {
     clear_children(store, parent);
     apply_entries(store, Some(parent), entries);
 }
@@ -195,10 +184,7 @@ pub fn iter_for_path(store: &gtk4::TreeStore, path: &gtk4::TreePath) -> Option<g
     store.iter(path)
 }
 
-pub fn find_iter_by_file_path(
-    store: &gtk4::TreeStore,
-    file_path: &str,
-) -> Option<gtk4::TreeIter> {
+pub fn find_iter_by_file_path(store: &gtk4::TreeStore, file_path: &str) -> Option<gtk4::TreeIter> {
     let mut iter = store.iter_first()?;
     loop {
         if let Some(found) = find_iter_recursive(store, &iter, file_path) {
@@ -265,11 +251,7 @@ fn clear_children(store: &gtk4::TreeStore, parent: &gtk4::TreeIter) {
     }
 }
 
-fn scan_dir(
-    path: &str,
-    depth: u32,
-    ignored: &std::collections::HashSet<String>,
-) -> Vec<TreeEntry> {
+fn scan_dir(path: &str, depth: u32, ignored: &std::collections::HashSet<String>) -> Vec<TreeEntry> {
     let mut entries: Vec<TreeEntry> = std::fs::read_dir(path)
         .into_iter()
         .flatten()
@@ -323,11 +305,7 @@ fn scan_dir(
     entries
 }
 
-fn apply_entries(
-    store: &gtk4::TreeStore,
-    parent: Option<&gtk4::TreeIter>,
-    entries: &[TreeEntry],
-) {
+fn apply_entries(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, entries: &[TreeEntry]) {
     for entry in entries {
         let iter = store.append(parent);
         store.set_value(&iter, COL_NAME, &entry.name.to_value());
