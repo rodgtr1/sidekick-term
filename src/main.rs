@@ -28,6 +28,10 @@ use webkit6::prelude::WebViewExt as _;
 
 const APP_ID: &str = "com.travismedia.sidekick";
 const AGENT_STATUS_TERMPROP: &str = "vte.ext.sidekick.agent";
+const SIDE_RAIL_WIDTH: i32 = 220;
+const TOOL_PANEL_WIDTH: i32 = SIDE_RAIL_WIDTH - 1;
+const NOTEBOOK_TAB_WIDTH: i32 = SIDE_RAIL_WIDTH - 3;
+const SESSION_TAB_WIDTH: i32 = NOTEBOOK_TAB_WIDTH - 22;
 
 #[derive(Clone, Copy, PartialEq)]
 enum AgentState {
@@ -190,7 +194,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
 
     // Panel stack is the togglable sidebar content (no activity bar inside)
     let tree_sidebar = panel_stack.clone();
-    tree_sidebar.set_width_request(220);
+    tree_sidebar.set_width_request(TOOL_PANEL_WIDTH);
     tree_sidebar.add_css_class("sidebar");
     tree_sidebar.set_visible(false);
 
@@ -1746,7 +1750,7 @@ fn is_known_agent_command(command: &str) -> bool {
 fn build_terminal_tab_label() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label) {
     let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     row.add_css_class("session-tab");
-    row.set_hexpand(true);
+    row.set_size_request(SESSION_TAB_WIDTH, -1);
 
     let dot = gtk4::Label::new(None);
     dot.add_css_class("session-tab-dot");
@@ -1756,18 +1760,23 @@ fn build_terminal_tab_label() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Lab
 
     let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
     text.set_hexpand(true);
+    text.set_size_request(SESSION_TAB_WIDTH - 28, -1);
 
     let title = gtk4::Label::new(Some("~"));
     title.add_css_class("session-tab-title");
     title.set_xalign(0.0);
     title.set_ellipsize(pango::EllipsizeMode::End);
+    title.set_width_chars(1);
     title.set_max_width_chars(24);
+    title.set_hexpand(true);
 
     let detail = gtk4::Label::new(Some("~"));
     detail.add_css_class("session-tab-detail");
     detail.set_xalign(0.0);
     detail.set_ellipsize(pango::EllipsizeMode::End);
+    detail.set_width_chars(1);
     detail.set_max_width_chars(28);
+    detail.set_hexpand(true);
 
     text.append(&title);
     text.append(&detail);
@@ -1879,7 +1888,8 @@ fn build_css(cfg: &config::Config) -> String {
         }}
         notebook header.left {{
             border-right: 1px solid #313244;
-            min-width: 220px;
+            min-width: {side_rail_width}px;
+            max-width: {side_rail_width}px;
         }}
         notebook header.top {{
             border-bottom: 1px solid #313244;
@@ -1890,7 +1900,9 @@ fn build_css(cfg: &config::Config) -> String {
             border-radius: 0;
             border: none;
             box-shadow: none;
-            min-width: 220px;
+            margin-right: 2px;
+            min-width: {notebook_tab_width}px;
+            max-width: {notebook_tab_width}px;
         }}
         notebook header tab:checked {{
             color: #cdd6f4;
@@ -1903,7 +1915,8 @@ fn build_css(cfg: &config::Config) -> String {
         }}
         .session-tab {{
             padding: 9px 10px;
-            min-width: 198px;
+            min-width: {session_tab_width}px;
+            max-width: {session_tab_width}px;
         }}
         .session-tab-dot {{
             font-size: 9pt;
@@ -1923,6 +1936,8 @@ fn build_css(cfg: &config::Config) -> String {
         .sidebar {{
             background-color: #181825;
             border-right: 1px solid #313244;
+            min-width: {tool_panel_width}px;
+            max-width: {tool_panel_width}px;
         }}
         .sidebar-header {{
             background-color: #181825;
@@ -2163,5 +2178,9 @@ fn build_css(cfg: &config::Config) -> String {
         }}
         ",
         p = cfg.window.padding,
+        side_rail_width = SIDE_RAIL_WIDTH,
+        tool_panel_width = TOOL_PANEL_WIDTH,
+        notebook_tab_width = NOTEBOOK_TAB_WIDTH,
+        session_tab_width = SESSION_TAB_WIDTH,
     )
 }
