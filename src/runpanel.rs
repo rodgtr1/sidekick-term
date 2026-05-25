@@ -15,7 +15,10 @@ pub fn load_tasks(root: &str) -> Vec<Task> {
         Err(_) => return vec![],
     };
     #[derive(serde::Deserialize)]
-    struct TaskFile { #[serde(default)] tasks: Vec<Task> }
+    struct TaskFile {
+        #[serde(default)]
+        tasks: Vec<Task>,
+    }
     toml::from_str::<TaskFile>(&content)
         .map(|f| f.tasks)
         .unwrap_or_default()

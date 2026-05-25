@@ -8,3 +8,5 @@ Icon=sidekick
 Terminal=false
 Categories=Development;TerminalEmulator;
 StartupNotify=true
+X-TerminalArgExec=-e
+X-TerminalArgDir=--dir=

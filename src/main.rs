@@ -75,12 +75,30 @@ enum UiResult {
 }
 
 fn main() -> glib::ExitCode {
+    let raw: Vec<String> = std::env::args().collect();
+    let mut initial_dir: Option<String> = None;
+    let mut gtk_args: Vec<String> = vec![raw[0].clone()];
+    let mut i = 1;
+    while i < raw.len() {
+        if raw[i] == "--dir" || raw[i] == "-d" {
+            i += 1;
+            if i < raw.len() {
+                initial_dir = Some(raw[i].clone());
+            }
+        } else if let Some(val) = raw[i].strip_prefix("--dir=") {
+            initial_dir = Some(val.to_string());
+        } else {
+            gtk_args.push(raw[i].clone());
+        }
+        i += 1;
+    }
+
     let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
-    app.run()
+    app.connect_activate(move |app| build_ui(app, initial_dir.as_deref()));
+    app.run_with_args(&gtk_args)
 }
 
-fn build_ui(app: &Application) {
+fn build_ui(app: &Application, initial_dir: Option<&str>) {
     install_agent_status_termprop();
 
     let cfg = Rc::new(RefCell::new(config::Config::load()));
@@ -138,7 +156,6 @@ fn build_ui(app: &Application) {
 
     let btn_files = gtk4::Button::new();
     btn_files.add_css_class("activity-btn");
-    btn_files.add_css_class("active");
     let img_files = gtk4::Image::from_icon_name("folder-symbolic");
     img_files.set_pixel_size(20);
     btn_files.set_child(Some(&img_files));
@@ -174,6 +191,7 @@ fn build_ui(app: &Application) {
     let tree_sidebar = panel_stack.clone();
     tree_sidebar.set_width_request(220);
     tree_sidebar.add_css_class("sidebar");
+    tree_sidebar.set_visible(false);
 
     // Browser panel (hidden by default)
     let browser_panel = browser::build();
@@ -192,17 +210,17 @@ fn build_ui(app: &Application) {
 
     content_paned.set_hexpand(true);
 
-    // Root layout: activity bar (always visible) | sidebar | content
+    // Root layout starts minimized: activity bar (always visible) | content.
+    // The sidebar is inserted between them only when opened.
     let root_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     root_box.append(&activity_bar);
-    root_box.append(&tree_sidebar);
     root_box.append(&content_paned);
 
-    // Sidebar visible by default
-    let sidebar_visible: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+    // Sidebar content starts minimized; the activity bar remains visible.
+    let sidebar_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let browser_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-    add_tab(&notebook, &cfg.borrow(), None, &agent_map);
+    add_tab(&notebook, &cfg.borrow(), initial_dir, &agent_map);
 
     let css = gtk4::CssProvider::new();
     css.load_from_string(&build_css(&cfg.borrow()));
@@ -608,16 +626,26 @@ fn build_ui(app: &Application) {
     let switch_panel: Rc<dyn Fn(&'static str, usize)> = Rc::new({
         let stack = panel_stack.clone();
         let sidebar = tree_sidebar.clone();
+        let root = root_box.clone();
+        let activity = activity_bar.clone();
         let vis = Rc::clone(&sidebar_visible);
         let btns = all_btns.clone();
         move |page: &'static str, btn_idx: usize| {
-            let already =
-                stack.visible_child_name().as_deref() == Some(page) && sidebar.is_visible();
+            let already = stack.visible_child_name().as_deref() == Some(page) && vis.get();
             if already {
                 vis.set(false);
                 sidebar.set_visible(false);
+                if sidebar.parent().is_some() {
+                    root.remove(&sidebar);
+                }
+                for b in btns.iter() {
+                    b.remove_css_class("active");
+                }
             } else {
                 vis.set(true);
+                if sidebar.parent().is_none() {
+                    root.insert_child_after(&sidebar, Some(&activity));
+                }
                 sidebar.set_visible(true);
                 stack.set_visible_child_name(page);
                 for (i, b) in btns.iter().enumerate() {
@@ -639,6 +667,8 @@ fn build_ui(app: &Application) {
         let win = window.clone();
         let sidebar_vis = Rc::clone(&sidebar_visible);
         let scroll = tree_sidebar.clone();
+        let root = root_box.clone();
+        let activity = activity_bar.clone();
         let browser_vis = Rc::clone(&browser_visible);
         let browser_wgt = browser_panel.widget.clone();
         let browser_wv = browser_panel.webview.clone();
@@ -650,6 +680,15 @@ fn build_ui(app: &Application) {
         let agent_map_kb = Rc::clone(&agent_map);
         let on_saved_k = Rc::clone(&on_editor_saved);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
+            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+            let alt = mods.contains(gdk::ModifierType::ALT_MASK);
+
+            if ctrl && !shift && !alt && matches!(key, gdk::Key::w | gdk::Key::W) {
+                win.close();
+                return glib::Propagation::Stop;
+            }
+
             // Let WebView handle all key events itself — its IME/input breaks under Capture
             if gtk4::prelude::GtkWindowExt::focus(&win)
                 .map(|f| f.is::<webkit6::WebView>())
@@ -657,9 +696,32 @@ fn build_ui(app: &Application) {
             {
                 return glib::Propagation::Proceed;
             }
-            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-            let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
-            let alt = mods.contains(gdk::ModifierType::ALT_MASK);
+
+            if let Some(term) = focused_window_terminal_on_current_page(&win, &nb) {
+                if matches!(
+                    (ctrl, shift, alt, key),
+                    (true, true, false, gdk::Key::c | gdk::Key::C)
+                        | (true, false, false, gdk::Key::Insert)
+                ) {
+                    term.copy_clipboard_format(vte4::Format::Text);
+                    return glib::Propagation::Stop;
+                }
+                if matches!(
+                    (ctrl, shift, alt, key),
+                    (true, false, false, gdk::Key::v | gdk::Key::V)
+                ) {
+                    paste_clipboard_image_or_text(&term);
+                    return glib::Propagation::Stop;
+                }
+                if matches!(
+                    (ctrl, shift, alt, key),
+                    (true, true, false, gdk::Key::v | gdk::Key::V)
+                        | (false, true, false, gdk::Key::Insert)
+                ) {
+                    term.paste_clipboard();
+                    return glib::Propagation::Stop;
+                }
+            }
 
             match (ctrl, shift, alt, key) {
                 // New tab
@@ -670,17 +732,15 @@ fn build_ui(app: &Application) {
                 }
                 // Close pane / tab (also closes editor tabs)
                 (true, true, false, gdk::Key::w | gdk::Key::W) => {
-                    if gtk4::prelude::GtkWindowExt::focus(&win)
-                        .and_then(|w| w.downcast::<vte4::Terminal>().ok())
-                        .is_some()
-                    {
-                        pane::close(&win, &nb);
+                    if focused_terminal(&win, &nb).is_some() {
+                        if !current_page_is_final_terminal_tab(&nb) {
+                            pane::close(&win, &nb);
+                        }
                     } else {
-                        // Editor tab or other — just remove current page
+                        // Editor tab or other — remove current page unless it is the last one.
                         if let Some(idx) = nb.current_page() {
-                            nb.remove_page(Some(idx));
-                            if nb.n_pages() == 0 {
-                                std::process::exit(0);
+                            if nb.n_pages() > 1 {
+                                nb.remove_page(Some(idx));
                             }
                         }
                     }
@@ -764,6 +824,11 @@ fn build_ui(app: &Application) {
                 (true, true, false, gdk::Key::b | gdk::Key::B) => {
                     let visible = !sidebar_vis.get();
                     sidebar_vis.set(visible);
+                    if visible && scroll.parent().is_none() {
+                        root.insert_child_after(&scroll, Some(&activity));
+                    } else if !visible && scroll.parent().is_some() {
+                        root.remove(&scroll);
+                    }
                     scroll.set_visible(visible);
                     glib::Propagation::Stop
                 }
@@ -789,21 +854,23 @@ fn build_ui(app: &Application) {
 
     window.add_controller(key_ctrl);
 
-    // Open file in editor tab when tree row is activated (M10)
+    // Open files when tree rows are activated (M10)
     {
         let store = Rc::clone(&tree_store);
         let nb_editor = notebook.clone();
         let cfg_editor = Rc::clone(&cfg);
+        let agent_map_editor = Rc::clone(&agent_map);
         let on_saved_ref = Rc::clone(&on_editor_saved);
         #[allow(deprecated)]
         tree_view.connect_row_activated(move |_tv, path, _col| {
             if let Some(iter) = filetree::iter_for_path(&store, path) {
                 let (file_path, is_dir) = filetree::row_info(&store, &iter);
                 if !is_dir {
-                    editor::open_with_save_callback(
+                    open_file_from_file_manager(
                         &file_path,
                         &nb_editor,
                         &cfg_editor.borrow(),
+                        &agent_map_editor,
                         on_saved_ref.borrow().as_ref().map(Rc::clone),
                     );
                 }
@@ -1052,6 +1119,22 @@ fn build_ui(app: &Application) {
     }
 
     window.present();
+    {
+        let sidebar = tree_sidebar.clone();
+        let root = root_box.clone();
+        let vis = Rc::clone(&sidebar_visible);
+        let btns = all_btns.clone();
+        glib::idle_add_local_once(move || {
+            vis.set(false);
+            sidebar.set_visible(false);
+            if sidebar.parent().is_some() {
+                root.remove(&sidebar);
+            }
+            for btn in btns {
+                btn.remove_css_class("active");
+            }
+        });
+    }
     {
         let window = window.clone();
         glib::idle_add_local_once(move || {
@@ -1419,7 +1502,9 @@ fn add_tab_with_command(
     terminal.connect_child_exited(move |_, _| {
         agent_map_close.borrow_mut().remove(&agent_key);
         if let Some(t) = weak.upgrade() {
-            pane::close_terminal(&t, &nb);
+            if pane::close_terminal(&t, &nb) {
+                std::process::exit(0);
+            }
         }
     });
 }
@@ -1430,8 +1515,34 @@ fn open_config_in_nvim(
     agent_map: &Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>>,
 ) {
     let path = config::config_path();
+    open_path_in_nvim(notebook, cfg, agent_map, &path);
+}
+
+fn open_file_from_file_manager(
+    path: &str,
+    notebook: &Notebook,
+    cfg: &config::Config,
+    agent_map: &Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>>,
+    on_saved: Option<Rc<dyn Fn(&str)>>,
+) {
+    match cfg.editor.file_manager_open.as_str() {
+        "nvim" | "vim" | "neovim" => {
+            open_path_in_nvim(notebook, cfg, agent_map, std::path::Path::new(path));
+        }
+        _ => {
+            editor::open_with_save_callback(path, notebook, cfg, on_saved);
+        }
+    }
+}
+
+fn open_path_in_nvim(
+    notebook: &Notebook,
+    cfg: &config::Config,
+    agent_map: &Rc<RefCell<HashMap<usize, Rc<Cell<AgentState>>>>>,
+    path: &std::path::Path,
+) {
     let cwd = path.parent().and_then(|p| p.to_str());
-    let command = format!("nvim {}", shell_quote_path(&path));
+    let command = format!("nvim {}", shell_quote_path(path));
     add_tab_with_command(notebook, cfg, cwd, agent_map, Some(command));
 }
 
@@ -1439,7 +1550,12 @@ fn focused_terminal(window: &ApplicationWindow, notebook: &Notebook) -> Option<v
     if let Some(term) =
         gtk4::prelude::GtkWindowExt::focus(window).and_then(|w| w.downcast::<vte4::Terminal>().ok())
     {
-        return Some(term);
+        let term_w: gtk4::Widget = term.clone().upcast();
+        if let Some(page) = notebook_page_of(&term_w, notebook) {
+            if notebook.page_num(&page) == notebook.current_page() {
+                return Some(term);
+            }
+        }
     }
     let page = notebook.nth_page(Some(notebook.current_page()?))?;
     pane::collect_terminals_pub(&page).into_iter().next()
@@ -1447,6 +1563,58 @@ fn focused_terminal(window: &ApplicationWindow, notebook: &Notebook) -> Option<v
 
 fn focused_terminal_cwd(window: &ApplicationWindow, notebook: &Notebook) -> Option<String> {
     focused_terminal(window, notebook).and_then(|t| terminal_cwd(&t))
+}
+
+fn paste_clipboard_image_or_text(terminal: &vte4::Terminal) {
+    let clipboard = terminal.clipboard();
+    let term = terminal.clone();
+    clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| match result {
+        Ok(Some(texture)) => match save_clipboard_texture(&texture) {
+            Ok(path) => {
+                let text = format!("{} ", path.display());
+                term.feed_child(text.as_bytes());
+            }
+            Err(err) => {
+                eprintln!("sidekick: failed to save clipboard image: {err}");
+                term.paste_clipboard();
+            }
+        },
+        Ok(None) => term.paste_clipboard(),
+        Err(err) => {
+            eprintln!("sidekick: failed to read clipboard image: {err}");
+            term.paste_clipboard();
+        }
+    });
+}
+
+fn save_clipboard_texture(texture: &gdk::Texture) -> Result<std::path::PathBuf, glib::BoolError> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "sidekick-clipboard-{}-{}.png",
+        std::process::id(),
+        glib::monotonic_time()
+    ));
+    texture.save_to_png(&path)?;
+    Ok(path)
+}
+
+fn focused_window_terminal_on_current_page(
+    window: &ApplicationWindow,
+    notebook: &Notebook,
+) -> Option<vte4::Terminal> {
+    let term = gtk4::prelude::GtkWindowExt::focus(window)
+        .and_then(|w| w.downcast::<vte4::Terminal>().ok())?;
+    let term_w: gtk4::Widget = term.clone().upcast();
+    let page = notebook_page_of(&term_w, notebook)?;
+    (notebook.page_num(&page) == notebook.current_page()).then_some(term)
+}
+
+fn current_page_is_final_terminal_tab(notebook: &Notebook) -> bool {
+    notebook.n_pages() <= 1
+        && notebook
+            .nth_page(Some(notebook.current_page().unwrap_or(0)))
+            .map(|page| page.is::<vte4::Terminal>())
+            .unwrap_or(false)
 }
 
 /// Get the cwd of the foreground process running in a terminal via the PTY.

@@ -116,13 +116,19 @@ will show that directory's file tree and git changes.
 
 Open files by activating them in the file tree. Directories expand in place.
 Changed git files open as read-only diff tabs when activated from the git panel.
+File-tree files can open either in the built-in editor or in a new `nvim`
+terminal tab, based on the `[editor]` configuration.
 
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
 |---|---|
+| `Ctrl+W` | Close sidekick |
+| `Ctrl+Shift+C`, `Ctrl+Insert` | Copy selected terminal text |
+| `Ctrl+V` | Paste clipboard image as a temp PNG path, or paste text if no image is available |
+| `Ctrl+Shift+V`, `Shift+Insert` | Paste text into the focused terminal |
 | `Ctrl+Shift+T` | New terminal tab |
-| `Ctrl+Shift+W` | Close the current pane, editor tab, or diff tab |
+| `Ctrl+Shift+W` | Close the current pane, editor tab, or diff tab; the final tab stays open |
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+Shift+Tab` | Previous tab |
 | `Ctrl+Shift+D` | Split terminal right |
@@ -177,6 +183,11 @@ scroll_on_keystroke = true
 allow_hyperlinks = true
 mouse_autohide = true
 audible_bell = false
+
+[editor]
+# builtin | nvim
+file_manager_open = "builtin"
+word_wrap = true
 ```
 
 ## Shell Integration

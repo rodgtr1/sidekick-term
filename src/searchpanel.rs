@@ -69,10 +69,7 @@ pub fn populate(list: &gtk4::ListBox, files: &[FileMatches]) {
         } else {
             file.lines.len().to_string()
         };
-        let label = gtk4::Label::new(Some(&format!(
-            "{}  ({})",
-            file.rel_path, count_str
-        )));
+        let label = gtk4::Label::new(Some(&format!("{}  ({})", file.rel_path, count_str)));
         label.set_xalign(0.0);
         label.set_margin_start(8);
         label.set_margin_end(8);

@@ -8,7 +8,7 @@ pub fn split(
     cfg: &config::Config,
     orientation: gtk4::Orientation,
 ) {
-    let focused = match focused_terminal(window) {
+    let focused = match focused_terminal(window, notebook) {
         Some(t) => t,
         None => return,
     };
@@ -32,7 +32,9 @@ pub fn split(
         let weak = new_term.downgrade();
         new_term.connect_child_exited(move |_, _| {
             if let Some(t) = weak.upgrade() {
-                close_terminal(&t, &nb);
+                if close_terminal(&t, &nb) {
+                    std::process::exit(0);
+                }
             }
         });
     }
@@ -97,22 +99,19 @@ pub fn split(
     new_term.grab_focus();
 }
 
-pub fn close(window: &gtk4::ApplicationWindow, notebook: &gtk4::Notebook) {
-    if let Some(t) = focused_terminal(window) {
-        close_terminal(&t, notebook);
-    }
+pub fn close(window: &gtk4::ApplicationWindow, notebook: &gtk4::Notebook) -> bool {
+    focused_terminal(window, notebook)
+        .map(|t| close_terminal(&t, notebook))
+        .unwrap_or(false)
 }
 
-pub fn close_terminal(terminal: &vte4::Terminal, notebook: &gtk4::Notebook) {
+pub fn close_terminal(terminal: &vte4::Terminal, notebook: &gtk4::Notebook) -> bool {
     let term_w: gtk4::Widget = terminal.clone().upcast();
 
     // Sole pane — close the whole tab
     if let Some(idx) = notebook.page_num(&term_w) {
         notebook.remove_page(Some(idx));
-        if notebook.n_pages() == 0 {
-            std::process::exit(0);
-        }
-        return;
+        return notebook.n_pages() == 0;
     }
 
     let parent = match term_w
@@ -120,7 +119,7 @@ pub fn close_terminal(terminal: &vte4::Terminal, notebook: &gtk4::Notebook) {
         .and_then(|p| p.downcast::<gtk4::Paned>().ok())
     {
         Some(p) => p,
-        None => return,
+        None => return false,
     };
 
     let start = parent.start_child();
@@ -130,7 +129,7 @@ pub fn close_terminal(terminal: &vte4::Terminal, notebook: &gtk4::Notebook) {
 
     let sibling = match sibling {
         Some(s) => s,
-        None => return,
+        None => return false,
     };
 
     // Detach sibling via the container API before re-parenting it.
@@ -159,10 +158,11 @@ pub fn close_terminal(terminal: &vte4::Terminal, notebook: &gtk4::Notebook) {
     }
 
     focus_first_terminal(&sibling);
+    false
 }
 
 pub fn navigate(window: &gtk4::ApplicationWindow, notebook: &gtk4::Notebook, forward: bool) {
-    let focused = match focused_terminal(window) {
+    let focused = match focused_terminal(window, notebook) {
         Some(t) => t,
         None => return,
     };
@@ -195,14 +195,39 @@ pub fn navigate(window: &gtk4::ApplicationWindow, notebook: &gtk4::Notebook, for
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn focused_terminal(window: &gtk4::ApplicationWindow) -> Option<vte4::Terminal> {
-    gtk4::prelude::GtkWindowExt::focus(window)?
-        .downcast::<vte4::Terminal>()
-        .ok()
+fn focused_terminal(
+    window: &gtk4::ApplicationWindow,
+    notebook: &gtk4::Notebook,
+) -> Option<vte4::Terminal> {
+    let current_page = notebook.nth_page(Some(notebook.current_page()?))?;
+
+    if let Some(term) =
+        gtk4::prelude::GtkWindowExt::focus(window).and_then(|w| w.downcast::<vte4::Terminal>().ok())
+    {
+        let term_w: gtk4::Widget = term.clone().upcast();
+        if widget_contains(&current_page, &term_w) {
+            return Some(term);
+        }
+    }
+
+    collect_terminals(&current_page).into_iter().next()
 }
 
 fn same_widget(a: Option<&gtk4::Widget>, b: &gtk4::Widget) -> bool {
     a.map(|w| w.as_ptr() == b.as_ptr()).unwrap_or(false)
+}
+
+fn widget_contains(root: &gtk4::Widget, child: &gtk4::Widget) -> bool {
+    let mut widget = child.clone();
+    loop {
+        if same_widget(Some(&widget), root) {
+            return true;
+        }
+        widget = match widget.parent() {
+            Some(parent) => parent,
+            None => return false,
+        };
+    }
 }
 
 fn focus_first_terminal(widget: &gtk4::Widget) {

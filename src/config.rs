@@ -57,6 +57,8 @@ pub struct BehaviorConfig {
 #[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct EditorConfig {
+    // builtin | nvim
+    pub file_manager_open: String,
     pub word_wrap: bool,
 }
 
@@ -109,7 +111,10 @@ impl Default for BehaviorConfig {
 
 impl Default for EditorConfig {
     fn default() -> Self {
-        Self { word_wrap: true }
+        Self {
+            file_manager_open: "builtin".to_string(),
+            word_wrap: true,
+        }
     }
 }
 
@@ -150,6 +155,8 @@ mouse_autohide = true
 audible_bell = false
 
 [editor]
+# File manager activation opens files in: builtin | nvim
+file_manager_open = "builtin"
 # Wrap long lines in the editor (true = word wrap, false = horizontal scroll)
 word_wrap = true
 
