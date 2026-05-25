@@ -108,6 +108,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     let notebook = Notebook::new();
     notebook.set_scrollable(true);
     notebook.set_show_border(false);
+    notebook.set_tab_pos(gtk4::PositionType::Left);
     notebook.add_css_class("terminal-notebook");
 
     // File tree
@@ -1299,8 +1300,8 @@ fn add_tab_with_command(
         .borrow_mut()
         .insert(agent_key, Rc::clone(&agent_state));
 
-    let label = gtk4::Label::new(Some("  ~  "));
-    notebook.append_page(&terminal, Some(&label));
+    let (tab_label, tab_dot, tab_title, tab_detail) = build_terminal_tab_label();
+    notebook.append_page(&terminal, Some(&tab_label));
     notebook.set_current_page(Some(page_idx));
     let t = terminal.clone();
     glib::idle_add_local(move || {
@@ -1340,7 +1341,7 @@ fn add_tab_with_command(
     let last_terminal_change: Rc<RefCell<Instant>> = Rc::new(RefCell::new(Instant::now()));
     let last_user_input: Rc<RefCell<Instant>> =
         Rc::new(RefCell::new(Instant::now() - Duration::from_secs(10)));
-    let running_pulse: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let running_frame: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     {
         let dirty_c = Rc::clone(&dirty);
         let agent_c = Rc::clone(&agent_state);
@@ -1415,12 +1416,14 @@ fn add_tab_with_command(
 
     // Poll cwd + git branch; show agent/dirty indicator.
     {
-        let label_ref = label.clone();
+        let tab_dot_ref = tab_dot.clone();
+        let tab_title_ref = tab_title.clone();
+        let tab_detail_ref = tab_detail.clone();
         let pid_ref = Rc::clone(&pid_cell);
         let dirty_ref = Rc::clone(&dirty);
         let agent_ref = Rc::clone(&agent_state);
         let last_terminal_change_ref = Rc::clone(&last_terminal_change);
-        let running_pulse_ref = Rc::clone(&running_pulse);
+        let running_frame_ref = Rc::clone(&running_frame);
         let nb_ref = notebook.clone();
         let term_ref = terminal.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
@@ -1453,42 +1456,63 @@ fn add_tab_with_command(
                 agent_ref.set(AgentState::Ready);
             }
 
-            let title = tab::tab_title(pid);
-            let title_text = title.trim_start();
-            let escaped_title = glib::markup_escape_text(title_text);
+            let (title_text, detail_text) = tab::tab_title_parts(pid);
+            let escaped_title = glib::markup_escape_text(&title_text);
             match agent_ref.get() {
                 AgentState::AutoBusy | AgentState::Busy => {
-                    running_pulse_ref.set(!running_pulse_ref.get());
-                    let color = if running_pulse_ref.get() {
-                        "#f9e2af"
-                    } else {
-                        "#c9a96a"
-                    };
-                    label_ref.set_markup(&format!(
-                        "{}{}",
-                        tab_indicator_markup(color),
-                        escaped_title,
-                    ));
+                    const SPINNER_FRAMES: [&str; 10] =
+                        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let frame = running_frame_ref.get();
+                    running_frame_ref.set((frame + 1) % SPINNER_FRAMES.len());
+                    set_terminal_tab_label(
+                        &tab_dot_ref,
+                        &tab_title_ref,
+                        &tab_detail_ref,
+                        "#f9e2af",
+                        SPINNER_FRAMES[frame],
+                        &escaped_title,
+                        &detail_text,
+                    );
                 }
-                AgentState::Ready => label_ref.set_markup(&format!(
-                    "{}{}",
-                    tab_indicator_markup("#a6e3a1"),
-                    escaped_title,
-                )),
-                AgentState::Done => label_ref.set_markup(&format!(
-                    "{}{}",
-                    tab_indicator_markup("#89b4fa"),
-                    escaped_title,
-                )),
+                AgentState::Ready => set_terminal_tab_label(
+                    &tab_dot_ref,
+                    &tab_title_ref,
+                    &tab_detail_ref,
+                    "#a6e3a1",
+                    "●",
+                    &escaped_title,
+                    &detail_text,
+                ),
+                AgentState::Done => set_terminal_tab_label(
+                    &tab_dot_ref,
+                    &tab_title_ref,
+                    &tab_detail_ref,
+                    "#89b4fa",
+                    "●",
+                    &escaped_title,
+                    &detail_text,
+                ),
                 AgentState::Idle => {
                     if dirty_ref.get() {
-                        label_ref.set_markup(&format!(
-                            "{}{}",
-                            tab_indicator_markup("#f38ba8"),
-                            escaped_title,
-                        ));
+                        set_terminal_tab_label(
+                            &tab_dot_ref,
+                            &tab_title_ref,
+                            &tab_detail_ref,
+                            "#f38ba8",
+                            "●",
+                            &escaped_title,
+                            &detail_text,
+                        );
                     } else {
-                        label_ref.set_text(title_text);
+                        set_terminal_tab_label(
+                            &tab_dot_ref,
+                            &tab_title_ref,
+                            &tab_detail_ref,
+                            "#6c7086",
+                            "●",
+                            &escaped_title,
+                            &detail_text,
+                        );
                     }
                 }
             }
@@ -1719,8 +1743,56 @@ fn is_known_agent_command(command: &str) -> bool {
     command.contains("claude") || command.contains("codex")
 }
 
-fn tab_indicator_markup(color: &str) -> String {
-    format!("<span foreground=\"{}\" size=\"small\">●</span> ", color)
+fn build_terminal_tab_label() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label) {
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    row.add_css_class("session-tab");
+    row.set_hexpand(true);
+
+    let dot = gtk4::Label::new(None);
+    dot.add_css_class("session-tab-dot");
+    dot.set_markup("<span foreground=\"#6c7086\">●</span>");
+    dot.set_valign(gtk4::Align::Start);
+    dot.set_margin_top(2);
+
+    let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    text.set_hexpand(true);
+
+    let title = gtk4::Label::new(Some("~"));
+    title.add_css_class("session-tab-title");
+    title.set_xalign(0.0);
+    title.set_ellipsize(pango::EllipsizeMode::End);
+    title.set_max_width_chars(24);
+
+    let detail = gtk4::Label::new(Some("~"));
+    detail.add_css_class("session-tab-detail");
+    detail.set_xalign(0.0);
+    detail.set_ellipsize(pango::EllipsizeMode::End);
+    detail.set_max_width_chars(28);
+
+    text.append(&title);
+    text.append(&detail);
+    row.append(&dot);
+    row.append(&text);
+
+    (row, dot, title, detail)
+}
+
+fn set_terminal_tab_label(
+    dot: &gtk4::Label,
+    title: &gtk4::Label,
+    detail: &gtk4::Label,
+    color: &str,
+    marker: &str,
+    escaped_title: &str,
+    detail_text: &str,
+) {
+    dot.set_markup(&format!(
+        "<span foreground=\"{}\">{}</span>",
+        color,
+        glib::markup_escape_text(marker)
+    ));
+    title.set_markup(&format!("<b>{}</b>", escaped_title));
+    detail.set_text(detail_text);
 }
 
 fn agent_state_from_status(status: &str) -> Option<AgentState> {
@@ -1803,24 +1875,48 @@ fn build_css(cfg: &config::Config) -> String {
 
         notebook header {{
             background-color: #181825;
-            border-bottom: 1px solid #313244;
             padding: 0;
+        }}
+        notebook header.left {{
+            border-right: 1px solid #313244;
+            min-width: 220px;
+        }}
+        notebook header.top {{
+            border-bottom: 1px solid #313244;
         }}
         notebook header tab {{
             color: #6c7086;
-            padding: 6px 16px;
+            padding: 0;
             border-radius: 0;
             border: none;
             box-shadow: none;
+            min-width: 220px;
         }}
         notebook header tab:checked {{
             color: #cdd6f4;
             background-color: #1e1e2e;
-            border-bottom: 2px solid #cba6f7;
+            box-shadow: inset 2px 0 0 #89b4fa;
         }}
         notebook header tab:hover:not(:checked) {{
             color: #bac2de;
             background-color: #1e1e2e;
+        }}
+        .session-tab {{
+            padding: 9px 10px;
+            min-width: 198px;
+        }}
+        .session-tab-dot {{
+            font-size: 9pt;
+        }}
+        .session-tab-title {{
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+        .session-tab-detail {{
+            color: #a6adc8;
+            font-family: {font};
+            font-size: {run_task_pt}pt;
         }}
         notebook > stack {{ background-color: transparent; }}
 

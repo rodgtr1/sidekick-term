@@ -75,14 +75,14 @@ pub fn apply_config(terminal: &Terminal, cfg: &Config) {
     terminal.set_audible_bell(cfg.behavior.audible_bell);
 }
 
-/// Builds the tab label string from the shell's PID.
-/// Shows basename of cwd + git branch if inside a repo.
-pub fn tab_title(pid: i32) -> String {
+/// Builds the tab title and detail text from the shell's PID.
+/// Shows basename of cwd, plus branch and compact cwd details.
+pub fn tab_title_parts(pid: i32) -> (String, String) {
     let home = std::env::var("HOME").unwrap_or_default();
 
     let cwd = match std::fs::read_link(format!("/proc/{}/cwd", pid)) {
         Ok(p) => p,
-        Err(_) => return "~".to_string(),
+        Err(_) => return ("~".to_string(), "~".to_string()),
     };
 
     let branch = branch_for_cwd(cwd.to_str().unwrap_or("."));
@@ -96,10 +96,20 @@ pub fn tab_title(pid: i32) -> String {
             .unwrap_or_else(|| "~".to_string())
     };
 
-    match branch {
-        Some(b) => format!("  {} [{}]  ", short, b),
-        None => format!("  {}  ", short),
-    }
+    let compact_cwd = if cwd_str == home {
+        "~".to_string()
+    } else if !home.is_empty() && cwd_str.starts_with(&format!("{home}/")) {
+        cwd_str.replacen(&home, "~", 1)
+    } else {
+        cwd_str.to_string()
+    };
+
+    let detail = match branch {
+        Some(b) => format!("{} - {}", b, compact_cwd),
+        None => compact_cwd,
+    };
+
+    (short, detail)
 }
 
 fn branch_for_cwd(cwd: &str) -> Option<String> {
