@@ -7,6 +7,7 @@ mod git;
 mod gitpanel;
 mod ipc;
 mod limits;
+mod palette;
 mod pane;
 mod quickopen;
 mod runpanel;
@@ -827,26 +828,67 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         }
     });
 
+    // Sidebar / browser toggles shared by the key handler and command palette.
+    let toggle_sidebar: Rc<dyn Fn()> = Rc::new({
+        let vis = Rc::clone(&sidebar_visible);
+        let sidebar = tree_sidebar.clone();
+        let root = root_box.clone();
+        let activity = activity_bar.clone();
+        move || {
+            let visible = !vis.get();
+            vis.set(visible);
+            if visible && sidebar.parent().is_none() {
+                root.insert_child_after(&sidebar, Some(&activity));
+            } else if !visible && sidebar.parent().is_some() {
+                root.remove(&sidebar);
+            }
+            sidebar.set_visible(visible);
+        }
+    });
+    let toggle_browser: Rc<dyn Fn()> = Rc::new({
+        let vis = Rc::clone(&browser_visible);
+        let wgt = browser_panel.widget.clone();
+        let cpaned = content_paned.clone();
+        move || {
+            let visible = !vis.get();
+            vis.set(visible);
+            wgt.set_visible(visible);
+            if visible {
+                let total = cpaned.width();
+                cpaned.set_position(if total > 0 { total / 2 } else { 600 });
+                wgt.grab_focus();
+            }
+        }
+    });
+
+    let palette_actions = build_palette_actions(PaletteContext {
+        window: &window,
+        notebook: &notebook,
+        cfg: &cfg,
+        agent_map: &agent_map,
+        last_cwd: &last_cwd,
+        on_editor_saved: &on_editor_saved,
+        switch_panel: &switch_panel,
+        search_entry: &search_entry,
+        toggle_sidebar: &toggle_sidebar,
+        toggle_browser: &toggle_browser,
+    });
+
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
     {
         let nb = notebook.clone();
         let cfg = Rc::clone(&cfg);
         let win = window.clone();
-        let sidebar_vis = Rc::clone(&sidebar_visible);
-        let scroll = tree_sidebar.clone();
-        let root = root_box.clone();
-        let activity = activity_bar.clone();
-        let browser_vis = Rc::clone(&browser_visible);
-        let browser_wgt = browser_panel.widget.clone();
-        let browser_wv = browser_panel.webview.clone();
         let switch_panel = Rc::clone(&switch_panel);
         let search_entry_k = search_entry.clone();
-        let cpaned = content_paned.clone();
         let last_cwd_qo = Rc::clone(&last_cwd);
         let cfg_qo = Rc::clone(&cfg);
         let agent_map_kb = Rc::clone(&agent_map);
         let on_saved_k = Rc::clone(&on_editor_saved);
+        let toggle_sidebar_k = Rc::clone(&toggle_sidebar);
+        let toggle_browser_k = Rc::clone(&toggle_browser);
+        let palette_actions_k = Rc::clone(&palette_actions);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
             let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
@@ -1035,14 +1077,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 }
                 // Toggle sidebar
                 (true, true, false, gdk::Key::b | gdk::Key::B) => {
-                    let visible = !sidebar_vis.get();
-                    sidebar_vis.set(visible);
-                    if visible && scroll.parent().is_none() {
-                        root.insert_child_after(&scroll, Some(&activity));
-                    } else if !visible && scroll.parent().is_some() {
-                        root.remove(&scroll);
-                    }
-                    scroll.set_visible(visible);
+                    toggle_sidebar_k();
                     glib::Propagation::Stop
                 }
                 // Keyboard shortcuts help
@@ -1050,19 +1085,14 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                     shortcutshelp::show(&win);
                     glib::Propagation::Stop
                 }
+                // Command palette
+                (true, true, false, gdk::Key::p | gdk::Key::P) => {
+                    palette::show(&win, Rc::clone(&palette_actions_k));
+                    glib::Propagation::Stop
+                }
                 // Toggle browser panel
                 (true, true, false, gdk::Key::o | gdk::Key::O) => {
-                    let visible = !browser_vis.get();
-                    browser_vis.set(visible);
-                    browser_wgt.set_visible(visible);
-                    if visible {
-                        let total = cpaned.width();
-                        cpaned.set_position(if total > 0 { total / 2 } else { 600 });
-                        if browser_wv.uri().map(|u| u == "about:blank").unwrap_or(true) {
-                            // leave blank — user types their URL
-                        }
-                        browser_wgt.grab_focus();
-                    }
+                    toggle_browser_k();
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -1407,6 +1437,190 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
             allow_window_transparency(&window);
         });
     }
+}
+
+/// Everything the command palette actions need to capture; passed by
+/// reference and cloned per-action inside build_palette_actions.
+struct PaletteContext<'a> {
+    window: &'a ApplicationWindow,
+    notebook: &'a Notebook,
+    cfg: &'a Rc<RefCell<config::Config>>,
+    agent_map: &'a AgentMap,
+    last_cwd: &'a Rc<RefCell<String>>,
+    on_editor_saved: &'a Rc<RefCell<Option<SaveCallback>>>,
+    switch_panel: &'a Rc<dyn Fn(&'static str, usize)>,
+    search_entry: &'a gtk4::Entry,
+    toggle_sidebar: &'a Rc<dyn Fn()>,
+    toggle_browser: &'a Rc<dyn Fn()>,
+}
+
+fn build_palette_actions(ctx: PaletteContext<'_>) -> Rc<Vec<palette::Action>> {
+    let mut actions: Vec<palette::Action> = Vec::new();
+
+    let mut push = |title: &'static str, shortcut: Option<&'static str>, run: Rc<dyn Fn()>| {
+        actions.push(palette::Action {
+            title,
+            shortcut,
+            run,
+        });
+    };
+
+    {
+        let win = ctx.window.clone();
+        let nb = ctx.notebook.clone();
+        let cfg = Rc::clone(ctx.cfg);
+        let agent_map = Rc::clone(ctx.agent_map);
+        push(
+            "New Tab",
+            Some("Ctrl+Shift+T"),
+            Rc::new(move || {
+                let cwd = focused_terminal_cwd(&win, &nb);
+                add_tab(&nb, &cfg.borrow(), cwd.as_deref(), &agent_map);
+            }),
+        );
+    }
+    for (title, shortcut, orientation) in [
+        (
+            "Split Terminal Right",
+            "Ctrl+Shift+D",
+            gtk4::Orientation::Horizontal,
+        ),
+        (
+            "Split Terminal Down",
+            "Ctrl+Shift+X",
+            gtk4::Orientation::Vertical,
+        ),
+    ] {
+        let win = ctx.window.clone();
+        let nb = ctx.notebook.clone();
+        let cfg = Rc::clone(ctx.cfg);
+        let agent_map = Rc::clone(ctx.agent_map);
+        push(
+            title,
+            Some(shortcut),
+            Rc::new(move || {
+                split_focused(&win, &nb, &cfg.borrow(), &agent_map, orientation);
+            }),
+        );
+    }
+    {
+        let win = ctx.window.clone();
+        let nb = ctx.notebook.clone();
+        push(
+            "Find in Scrollback",
+            Some("Ctrl+Shift+H"),
+            Rc::new(move || {
+                if let Some(term) = focused_terminal(&win, &nb) {
+                    scrollsearch::show(&win, &term);
+                }
+            }),
+        );
+    }
+    {
+        let win = ctx.window.clone();
+        let nb = ctx.notebook.clone();
+        let cfg = Rc::clone(ctx.cfg);
+        let last_cwd = Rc::clone(ctx.last_cwd);
+        let on_saved = Rc::clone(ctx.on_editor_saved);
+        push(
+            "Quick Open File",
+            Some("Ctrl+F"),
+            Rc::new(move || {
+                let cwd = last_cwd.borrow().clone();
+                if cwd.is_empty() {
+                    return;
+                }
+                let repo = git::repo_root(&cwd);
+                let home = std::env::var("HOME").unwrap_or_default();
+                if repo.is_some() || cwd != home {
+                    let root = repo.unwrap_or(cwd);
+                    if let Some(on_saved) = on_saved.borrow().as_ref() {
+                        quickopen::show(&root, &win, &nb, &cfg, Rc::clone(on_saved));
+                    }
+                }
+            }),
+        );
+    }
+    for (title, shortcut, page, idx) in [
+        ("Show Files Panel", "Ctrl+Shift+E", "files", 0_usize),
+        ("Show Git Panel", "Ctrl+Shift+G", "git", 1),
+        ("Show Search Panel", "Ctrl+Shift+F", "search", 2),
+        ("Show Run Panel", "Ctrl+Shift+R", "run", 3),
+    ] {
+        let sp = Rc::clone(ctx.switch_panel);
+        let entry = (page == "search").then(|| ctx.search_entry.clone());
+        push(
+            title,
+            Some(shortcut),
+            Rc::new(move || {
+                sp(page, idx);
+                if let Some(e) = &entry {
+                    let e = e.clone();
+                    glib::idle_add_local_once(move || {
+                        e.grab_focus();
+                    });
+                }
+            }),
+        );
+    }
+    {
+        let toggle = Rc::clone(ctx.toggle_sidebar);
+        push(
+            "Toggle Sidebar",
+            Some("Ctrl+Shift+B"),
+            Rc::new(move || toggle()),
+        );
+    }
+    {
+        let toggle = Rc::clone(ctx.toggle_browser);
+        push(
+            "Toggle Browser Panel",
+            Some("Ctrl+Shift+O"),
+            Rc::new(move || toggle()),
+        );
+    }
+    for (title, shortcut, factor) in [
+        ("Zoom In", "Ctrl+=", Some(tab::ZOOM_STEP)),
+        ("Zoom Out", "Ctrl+-", Some(1.0 / tab::ZOOM_STEP)),
+        ("Zoom Reset", "Ctrl+0", None),
+    ] {
+        let win = ctx.window.clone();
+        push(
+            title,
+            Some(shortcut),
+            Rc::new(move || {
+                let zoom = match factor {
+                    Some(f) => tab::set_font_zoom(tab::font_zoom() * f),
+                    None => tab::set_font_zoom(1.0),
+                };
+                apply_font_zoom_all(&win, zoom);
+            }),
+        );
+    }
+    {
+        let nb = ctx.notebook.clone();
+        let cfg = Rc::clone(ctx.cfg);
+        let agent_map = Rc::clone(ctx.agent_map);
+        push(
+            "Open Config File",
+            Some("Ctrl+,"),
+            Rc::new(move || {
+                open_config_in_nvim(&nb, &cfg.borrow(), &agent_map);
+            }),
+        );
+    }
+    {
+        let win = ctx.window.clone();
+        push(
+            "Keyboard Shortcuts Help",
+            Some("Ctrl+Shift+?"),
+            Rc::new(move || {
+                shortcutshelp::show(&win);
+            }),
+        );
+    }
+
+    Rc::new(actions)
 }
 
 #[allow(deprecated)]
