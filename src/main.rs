@@ -42,6 +42,17 @@ enum AgentState {
     Done,
 }
 
+impl AgentState {
+    fn label(self) -> &'static str {
+        match self {
+            AgentState::Idle => "IDLE",
+            AgentState::AutoBusy | AgentState::Busy => "RUN",
+            AgentState::Ready => "WAIT",
+            AgentState::Done => "DONE",
+        }
+    }
+}
+
 enum UiResult {
     Tree {
         shell_cwd: String,
@@ -1423,6 +1434,7 @@ fn add_tab_with_command(
         let tab_dot_ref = tab_dot.clone();
         let tab_title_ref = tab_title.clone();
         let tab_detail_ref = tab_detail.clone();
+        let tab_label_ref = tab_label.clone();
         let pid_ref = Rc::clone(&pid_cell);
         let dirty_ref = Rc::clone(&dirty);
         let agent_ref = Rc::clone(&agent_state);
@@ -1446,23 +1458,37 @@ fn add_tab_with_command(
                 }
             }
 
-            // Auto-detect: any foreground process other than the shell = agent running.
+            // Auto-detect: non-agent foreground commands are running. Known
+            // agent TUIs stay in the foreground even while idle, so their
+            // busy state comes from output changes or explicit status hooks.
             let agent_running = terminal_has_foreground_process(&term_ref, pid);
-            match (agent_running, agent_ref.get()) {
-                (true, AgentState::Idle) => agent_ref.set(AgentState::AutoBusy),
-                (false, AgentState::AutoBusy) => agent_ref.set(AgentState::Idle),
+            let known_agent_running =
+                agent_running && terminal_has_known_agent_foreground_process(&term_ref, pid);
+            match (agent_running, known_agent_running, agent_ref.get()) {
+                (true, false, AgentState::Idle) => agent_ref.set(AgentState::AutoBusy),
+                (true, true, AgentState::Idle) => agent_ref.set(AgentState::Ready),
+                (false, _, AgentState::AutoBusy) => agent_ref.set(AgentState::Idle),
                 _ => {}
             }
             if matches!(agent_ref.get(), AgentState::AutoBusy)
                 && last_terminal_change_ref.borrow().elapsed() >= Duration::from_secs(2)
-                && terminal_has_known_agent_foreground_process(&term_ref, pid)
+                && known_agent_running
             {
                 agent_ref.set(AgentState::Ready);
             }
 
             let (title_text, detail_text) = tab::tab_title_parts(pid);
             let escaped_title = glib::markup_escape_text(&title_text);
-            match agent_ref.get() {
+            let state = agent_ref.get();
+            let status_label = if matches!(state, AgentState::Idle) && dirty_ref.get() {
+                "NEW"
+            } else {
+                state.label()
+            };
+            tab_label_ref
+                .set_tooltip_text(Some(&format!("Status: {}\n{}", status_label, detail_text)));
+
+            match state {
                 AgentState::AutoBusy | AgentState::Busy => {
                     const SPINNER_FRAMES: [&str; 10] =
                         ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
