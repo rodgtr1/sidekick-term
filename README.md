@@ -28,6 +28,14 @@ window.
 - Session restore: tabs, split layouts, and working directories come back on
   launch.
 - Desktop notifications and an activity-bar badge when agents are waiting.
+- Agents dashboard panel: every tab's agent state with elapsed time; click a
+  row to jump to that tab.
+- Hosts panel listing `~/.ssh/config` entries and Teleport (`tsh`) nodes;
+  activating a host opens a connected tab.
+- Command palette (`Ctrl+Shift+P`) and a keyboard shortcuts help window
+  (`Ctrl+Shift+?`).
+- Desktop notification when a command running 15s+ finishes while the window
+  is unfocused, with exit status and duration (requires shell integration).
 - Run-panel tasks execute in a dedicated split with a live status indicator,
   optionally opening the embedded browser (inspector enabled) on a URL.
 - Editor follows external file changes (agents editing under you), warns
@@ -149,6 +157,9 @@ terminal tab, based on the `[editor]` configuration.
 | `Ctrl+F` | Quick open: search file names |
 | `Ctrl+Shift+F` | Show search-in-files panel |
 | `Ctrl+Shift+R` | Show run panel |
+| `Ctrl+Shift+A` | Show agents dashboard panel |
+| `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+?` | Keyboard shortcuts help |
 | `Ctrl+Shift+B` | Toggle sidebar |
 | `Ctrl+Shift+O` | Toggle embedded browser panel |
 | `Ctrl+,` | Open sidekick config in `nvim` |
@@ -268,7 +279,11 @@ echo 'source ~/.config/sidekick/shell-integration.zsh' >> ~/.zshrc
 ```
 
 Restart your shell or source `~/.zshrc`. Without this integration, sidekick still
-works, but background tabs will not show command-completion dots.
+works, but background tabs will not show command-completion dots and
+long-command notifications will not fire.
+
+If you installed shell integration before the exit-status feature was added,
+re-copy `shell-integration.zsh` to pick it up.
 
 ## Command-Line Control
 
@@ -396,6 +411,10 @@ The main modules are:
 - `src/git.rs` and `src/gitpanel.rs`: git status and changed-file UI.
 - `src/searchpanel.rs`: file content search (ripgrep/grep).
 - `src/runpanel.rs`: task runner with global and project-local tasks.
+- `src/agentpanel.rs`: agents dashboard panel.
+- `src/hostspanel.rs`: ssh / teleport hosts panel.
+- `src/palette.rs`: command palette.
+- `src/shortcutshelp.rs`: keyboard shortcuts help window.
 - `src/diff.rs`: colored diff views and accept/reject diff tabs.
 - `src/browser.rs`: optional WebKit side panel.
 - `src/config.rs`: configuration loading and defaults.

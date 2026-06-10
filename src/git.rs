@@ -181,7 +181,15 @@ pub fn file_diff(root: &str, file: &GitFile) -> Result<String, String> {
     // Staged: diff between HEAD and index. Unstaged: diff between index and working tree.
     let bytes = if file.staged {
         crate::limits::command_stdout_limited(
-            Command::new("git").args(["-C", root, "diff", "--cached", "HEAD", "--", &file.rel_path]),
+            Command::new("git").args([
+                "-C",
+                root,
+                "diff",
+                "--cached",
+                "HEAD",
+                "--",
+                &file.rel_path,
+            ]),
             crate::limits::MAX_DIFF_BYTES,
             &[],
             crate::limits::CapMode::Fail,
@@ -313,4 +321,3 @@ pub fn push(cwd: &str) -> Result<(), String> {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
-

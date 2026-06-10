@@ -958,8 +958,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 };
                 rows.push(agentpanel::Row {
                     page_index: i,
-                    title: tab_label_title(&nb, &page)
-                        .unwrap_or_else(|| format!("tab {}", i + 1)),
+                    title: tab_label_title(&nb, &page).unwrap_or_else(|| format!("tab {}", i + 1)),
                     state_label: label,
                     color: state.color(),
                     elapsed_secs,
@@ -1321,7 +1320,10 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     }
 
     // Stage all / Unstage all
-    for (btn, stage) in [(stage_all_btn.clone(), true), (unstage_all_btn.clone(), false)] {
+    for (btn, stage) in [
+        (stage_all_btn.clone(), true),
+        (unstage_all_btn.clone(), false),
+    ] {
         let last_cwd_c = Rc::clone(&last_cwd);
         let refresh = Rc::clone(&refresh_git);
         btn.connect_clicked(move |btn| {
@@ -1340,9 +1342,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
             match result {
                 Ok(()) => refresh(),
                 Err(e) => {
-                    let window = btn
-                        .root()
-                        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                    let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
                     gtk4::AlertDialog::builder()
                         .message("Git operation failed")
                         .detail(&e)
@@ -1895,12 +1895,7 @@ fn show_filetree_error(parent: &gtk4::Widget, message: &str, detail: &str) {
         .show(window.as_ref());
 }
 
-fn add_tab(
-    notebook: &Notebook,
-    cfg: &config::Config,
-    cwd: Option<&str>,
-    agent_map: &AgentMap,
-) {
+fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>, agent_map: &AgentMap) {
     add_tab_with_command(notebook, cfg, cwd, agent_map, None);
 }
 
@@ -2103,10 +2098,7 @@ fn add_tab_with_command(
             }
 
             let (auto_title, detail_text) = tab::tab_title_parts(pid);
-            let title_text = custom_title_ref
-                .borrow()
-                .clone()
-                .unwrap_or(auto_title);
+            let title_text = custom_title_ref.borrow().clone().unwrap_or(auto_title);
             let escaped_title = glib::markup_escape_text(&title_text);
             let state = agent_ref.get();
 
@@ -2262,10 +2254,7 @@ fn focused_terminal_cwd(window: &ApplicationWindow, notebook: &Notebook) -> Opti
 fn clipboard_has_image(terminal: &vte4::Terminal) -> bool {
     let formats = terminal.clipboard().formats();
     formats.contains_type(gdk::Texture::static_type())
-        || formats
-            .mime_types()
-            .iter()
-            .any(|m| m.starts_with("image/"))
+        || formats.mime_types().iter().any(|m| m.starts_with("image/"))
 }
 
 fn paste_clipboard_image(terminal: &vte4::Terminal) {
@@ -2638,7 +2627,9 @@ fn notify_long_command_finished(terminal: &vte4::Terminal, duration: Duration) {
         return;
     };
     let (exit_value, _) = terminal.termprop_string(CMD_EXIT_TERMPROP);
-    let exit_code = exit_value.as_ref().and_then(|v| v.as_str().parse::<i32>().ok());
+    let exit_code = exit_value
+        .as_ref()
+        .and_then(|v| v.as_str().parse::<i32>().ok());
     let summary = match exit_code {
         Some(code) if code != 0 => format!("Command failed (exit {code})"),
         _ => "Command finished".to_string(),

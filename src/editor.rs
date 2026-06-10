@@ -255,10 +255,9 @@ pub fn open_at_line(
                 return;
             }
             // Clean buffer: follow the file on disk (agents edit freely).
-            if let Ok(new_content) = crate::limits::read_text_file_limited(
-                &path_s,
-                crate::limits::MAX_EDITOR_FILE_BYTES,
-            ) {
+            if let Ok(new_content) =
+                crate::limits::read_text_file_limited(&path_s, crate::limits::MAX_EDITOR_FILE_BYTES)
+            {
                 let line = buf.iter_at_mark(&buf.get_insert()).line();
                 buf.set_text(&new_content);
                 buf.set_modified(false);
