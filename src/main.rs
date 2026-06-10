@@ -1,3 +1,4 @@
+mod agentpanel;
 mod browser;
 mod config;
 mod diff;
@@ -53,6 +54,16 @@ impl AgentState {
             AgentState::AutoBusy | AgentState::Busy => "RUN",
             AgentState::Ready => "WAIT",
             AgentState::Done => "DONE",
+        }
+    }
+
+    /// The tab-dot color for this state.
+    fn color(self) -> &'static str {
+        match self {
+            AgentState::Idle => "#6c7086",
+            AgentState::AutoBusy | AgentState::Busy => "#f9e2af",
+            AgentState::Ready => "#a6e3a1",
+            AgentState::Done => "#89b4fa",
         }
     }
 }
@@ -175,6 +186,9 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     // Run panel
     let (run_panel, run_list) = runpanel::build();
 
+    // Agents dashboard panel
+    let agent_panel = Rc::new(agentpanel::build());
+
     // File tree page (header + scroll stacked vertically)
     let files_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     files_page.append(&tree_header);
@@ -188,6 +202,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     panel_stack.add_named(&git_panel.widget, Some("git"));
     panel_stack.add_named(&search_panel, Some("search"));
     panel_stack.add_named(&run_panel, Some("run"));
+    panel_stack.add_named(&agent_panel.widget, Some("agents"));
 
     // Activity bar: narrow icon strip on the far left
     let activity_bar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -222,10 +237,18 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     btn_run.set_child(Some(&img_run));
     btn_run.set_tooltip_text(Some("Run Tasks (Ctrl+Shift+R)"));
 
+    let btn_agents = gtk4::Button::new();
+    btn_agents.add_css_class("activity-btn");
+    let img_agents = gtk4::Image::from_icon_name("system-users-symbolic");
+    img_agents.set_pixel_size(20);
+    btn_agents.set_child(Some(&img_agents));
+    btn_agents.set_tooltip_text(Some("Agents (Ctrl+Shift+A)"));
+
     activity_bar.append(&btn_files);
     activity_bar.append(&btn_git);
     activity_bar.append(&btn_search);
     activity_bar.append(&btn_run);
+    activity_bar.append(&btn_agents);
 
     // Badge at the bottom of the activity bar: count of agents waiting for input.
     let badge_spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -791,6 +814,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         btn_git.clone(),
         btn_search.clone(),
         btn_run.clone(),
+        btn_agents.clone(),
     ];
     let switch_panel: Rc<dyn Fn(&'static str, usize)> = Rc::new({
         let stack = panel_stack.clone();
@@ -873,6 +897,77 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         toggle_sidebar: &toggle_sidebar,
         toggle_browser: &toggle_browser,
     });
+
+    // Agents dashboard: refresh rows every second, jump to a tab on click.
+    {
+        let nb = notebook.clone();
+        let agent_map_d = Rc::clone(&agent_map);
+        let panel = Rc::clone(&agent_panel);
+        let stack = panel_stack.clone();
+        let vis = Rc::clone(&sidebar_visible);
+        // tab id -> (state label, when that state started). Updated every
+        // tick so elapsed times are right even while the panel is hidden.
+        let since: Rc<RefCell<HashMap<u64, (&'static str, Instant)>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        glib::timeout_add_seconds_local(1, move || {
+            let now = Instant::now();
+            let mut rows: Vec<agentpanel::Row> = Vec::new();
+            let mut live_tabs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for i in 0..nb.n_pages() {
+                let Some(page) = nb.nth_page(Some(i)) else {
+                    continue;
+                };
+                let Some(term) = pane::collect_terminals_pub(&page).into_iter().next() else {
+                    continue;
+                };
+                let key = term.as_ptr() as usize;
+                let Some((tab_id, state)) = agent_map_d
+                    .borrow()
+                    .get(&key)
+                    .map(|(id, cell)| (*id, cell.get()))
+                else {
+                    continue;
+                };
+                live_tabs.insert(tab_id);
+                let label = state.label();
+                let elapsed_secs = {
+                    let mut since_map = since.borrow_mut();
+                    let entry = since_map.entry(tab_id).or_insert((label, now));
+                    if entry.0 != label {
+                        *entry = (label, now);
+                    }
+                    entry.1.elapsed().as_secs()
+                };
+                rows.push(agentpanel::Row {
+                    page_index: i,
+                    title: tab_label_title(&nb, &page)
+                        .unwrap_or_else(|| format!("tab {}", i + 1)),
+                    state_label: label,
+                    color: state.color(),
+                    elapsed_secs,
+                });
+            }
+            since.borrow_mut().retain(|id, _| live_tabs.contains(id));
+            if vis.get() && stack.visible_child_name().as_deref() == Some("agents") {
+                panel.populate(&rows);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+    {
+        let nb = notebook.clone();
+        agent_panel.list.connect_row_activated(move |_, row| {
+            let Ok(idx) = row.widget_name().parse::<u32>() else {
+                return;
+            };
+            nb.set_current_page(Some(idx));
+            if let Some(page) = nb.nth_page(Some(idx)) {
+                if let Some(term) = pane::collect_terminals_pub(&page).into_iter().next() {
+                    term.grab_focus();
+                }
+            }
+        });
+    }
 
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -1046,6 +1141,10 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 }
                 (true, true, false, gdk::Key::r | gdk::Key::R) => {
                     switch_panel("run", 3);
+                    glib::Propagation::Stop
+                }
+                (true, true, false, gdk::Key::a | gdk::Key::A) => {
+                    switch_panel("agents", 4);
                     glib::Propagation::Stop
                 }
                 // Navigate panes
@@ -1287,6 +1386,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         (btn_git.clone(), "git"),
         (btn_search.clone(), "search"),
         (btn_run.clone(), "run"),
+        (btn_agents.clone(), "agents"),
     ]
     .into_iter()
     .enumerate()
@@ -1546,6 +1646,7 @@ fn build_palette_actions(ctx: PaletteContext<'_>) -> Rc<Vec<palette::Action>> {
         ("Show Git Panel", "Ctrl+Shift+G", "git", 1),
         ("Show Search Panel", "Ctrl+Shift+F", "search", 2),
         ("Show Run Panel", "Ctrl+Shift+R", "run", 3),
+        ("Show Agents Panel", "Ctrl+Shift+A", "agents", 4),
     ] {
         let sp = Rc::clone(ctx.switch_panel);
         let entry = (page == "search").then(|| ctx.search_entry.clone());
@@ -2241,6 +2342,15 @@ fn terminal_cwd(terminal: &vte4::Terminal) -> Option<String> {
     std::fs::read_link(format!("/proc/{}/cwd", pgid))
         .ok()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Read the title text out of a terminal tab's label widget
+/// (built by build_terminal_tab_label: [dot, [title, detail]]).
+fn tab_label_title(notebook: &Notebook, page: &gtk4::Widget) -> Option<String> {
+    let label_box = notebook.tab_label(page)?;
+    let text_box = label_box.first_child()?.next_sibling()?;
+    let title = text_box.first_child()?.downcast::<gtk4::Label>().ok()?;
+    Some(title.text().to_string())
 }
 
 /// Walk up the widget tree to find the notebook page that contains `widget`.
@@ -3165,6 +3275,18 @@ fn build_css(cfg: &config::Config) -> String {
             color: #6c7086;
             font-family: {font};
             font-size: {sidebar_pt}pt;
+        }}
+
+        .agent-panel-empty {{
+            color: #6c7086;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+        .agent-panel-state {{
+            color: #a6adc8;
+            font-family: {font};
+            font-size: {run_task_pt}pt;
+            font-weight: bold;
         }}
 
         .shortcuts-title {{
