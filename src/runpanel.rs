@@ -6,6 +6,19 @@ pub struct Task {
     pub cmd: String,
     #[serde(default)]
     pub llm: Option<String>,
+    /// URL to open in the embedded browser panel when the task runs
+    /// (e.g. "http://localhost:3000").
+    #[serde(default)]
+    pub open_browser: Option<String>,
+}
+
+/// What the user asked a task row to do.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TaskAction {
+    /// Type the command into the focused terminal without running it.
+    Paste,
+    /// Run the command in a dedicated split pane.
+    Run,
 }
 
 pub fn load_tasks(root: &str) -> Vec<Task> {
@@ -47,11 +60,12 @@ pub fn build() -> (gtk4::Box, gtk4::ListBox) {
 }
 
 /// Populate the task list from global (config.toml) and local (.sidekick.toml) tasks.
-/// Shows section headers when both are present. `inject` is called with
-/// (cmd, run_immediately) when a button is clicked.
+/// Shows section headers when both are present. `inject` is called with the
+/// task, the requested action, and the row's status label when a button is
+/// clicked.
 pub fn populate<F>(list: &gtk4::ListBox, global: &[Task], local: &[Task], inject: F)
 where
-    F: Fn(&str, bool) + Clone + 'static,
+    F: Fn(&Task, TaskAction, &gtk4::Label) + Clone + 'static,
 {
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
@@ -113,7 +127,7 @@ fn add_section_header(list: &gtk4::ListBox, text: &str) {
 
 fn add_task_row<F>(list: &gtk4::ListBox, task: &Task, inject: &F)
 where
-    F: Fn(&str, bool) + Clone + 'static,
+    F: Fn(&Task, TaskAction, &gtk4::Label) + Clone + 'static,
 {
     let row = gtk4::ListBoxRow::new();
     row.set_activatable(false);
@@ -132,21 +146,32 @@ where
     name_label.set_tooltip_text(Some(&task.cmd));
     name_label.add_css_class("run-task-name");
 
+    // Live run status (set by main when the task runs in a split).
+    let status_label = gtk4::Label::new(None);
+    status_label.add_css_class("run-task-name");
+
     let paste_btn = gtk4::Button::with_label("→");
     paste_btn.add_css_class("run-btn");
     paste_btn.set_tooltip_text(Some("Paste to prompt"));
-    let cmd = task.cmd.clone();
-    let inject_c = inject.clone();
-    paste_btn.connect_clicked(move |_| inject_c(&cmd, false));
+    {
+        let task = task.clone();
+        let status = status_label.clone();
+        let inject_c = inject.clone();
+        paste_btn.connect_clicked(move |_| inject_c(&task, TaskAction::Paste, &status));
+    }
 
     let run_btn = gtk4::Button::with_label("▶");
     run_btn.add_css_class("run-btn");
-    run_btn.set_tooltip_text(Some("Run in terminal"));
-    let cmd = task.cmd.clone();
-    let inject_c = inject.clone();
-    run_btn.connect_clicked(move |_| inject_c(&cmd, true));
+    run_btn.set_tooltip_text(Some("Run in a split below"));
+    {
+        let task = task.clone();
+        let status = status_label.clone();
+        let inject_c = inject.clone();
+        run_btn.connect_clicked(move |_| inject_c(&task, TaskAction::Run, &status));
+    }
 
     hbox.append(&name_label);
+    hbox.append(&status_label);
     hbox.append(&paste_btn);
     hbox.append(&run_btn);
 

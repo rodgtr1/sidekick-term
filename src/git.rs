@@ -179,18 +179,43 @@ pub fn file_diff(root: &str, file: &GitFile) -> Result<String, String> {
         return Ok(diff);
     }
     // Staged: diff between HEAD and index. Unstaged: diff between index and working tree.
-    let args: Vec<&str> = if file.staged {
-        vec!["-C", root, "diff", "--cached", "HEAD", "--", &file.rel_path]
+    let bytes = if file.staged {
+        crate::limits::command_stdout_limited(
+            Command::new("git").args(["-C", root, "diff", "--cached", "HEAD", "--", &file.rel_path]),
+            crate::limits::MAX_DIFF_BYTES,
+            &[],
+            crate::limits::CapMode::Fail,
+        )
+        .or_else(|_| {
+            // Repos without a HEAD yet (no commits): diff the index against
+            // the empty tree so freshly staged files still preview.
+            crate::limits::command_stdout_limited(
+                Command::new("git").args(["-C", root, "diff", "--cached", "--", &file.rel_path]),
+                crate::limits::MAX_DIFF_BYTES,
+                &[],
+                crate::limits::CapMode::Fail,
+            )
+        })?
     } else {
-        vec!["-C", root, "diff", "--", &file.rel_path]
+        crate::limits::command_stdout_limited(
+            Command::new("git").args(["-C", root, "diff", "--", &file.rel_path]),
+            crate::limits::MAX_DIFF_BYTES,
+            &[],
+            crate::limits::CapMode::Fail,
+        )?
     };
-    let bytes = crate::limits::command_stdout_limited(
-        Command::new("git").args(&args),
-        crate::limits::MAX_DIFF_BYTES,
-        &[],
-        crate::limits::CapMode::Fail,
-    )?;
     String::from_utf8(bytes).map_err(|_| "Diff is not valid UTF-8 text.".to_string())
+}
+
+pub fn current_branch(root: &str) -> Option<String> {
+    Command::new("git")
+        .args(["-C", root, "branch", "--show-current"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn ahead_count(cwd: &str) -> u32 {
@@ -218,6 +243,17 @@ pub fn stage(root: &str, rel_path: &str) -> Result<(), String> {
 
 pub fn unstage(root: &str, rel_path: &str) -> Result<(), String> {
     run_git(root, &["restore", "--staged", "--", rel_path])
+}
+
+pub fn stage_all(root: &str) -> Result<(), String> {
+    run_git(root, &["add", "-A"])
+}
+
+pub fn unstage_all(root: &str) -> Result<(), String> {
+    run_git(root, &["reset", "HEAD", "--", "."]).or_else(|_| {
+        // No HEAD yet (no commits): unstage by removing from the index.
+        run_git(root, &["rm", "--cached", "-r", "--quiet", "--", "."])
+    })
 }
 
 pub fn discard(root: &str, rel_path: &str, is_untracked: bool) -> Result<(), String> {

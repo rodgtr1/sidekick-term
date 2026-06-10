@@ -11,12 +11,32 @@ type BranchCache = HashMap<String, (Instant, Option<String>)>;
 static BRANCH_CACHE: OnceLock<Mutex<BranchCache>> = OnceLock::new();
 const BRANCH_CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// App-wide font zoom factor (runtime-only), stored as f64 bits so terminals
+/// created later pick up the current zoom.
+static FONT_ZOOM_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x3FF0_0000_0000_0000); // 1.0f64
+
+pub const ZOOM_MIN: f64 = 0.4;
+pub const ZOOM_MAX: f64 = 4.0;
+pub const ZOOM_STEP: f64 = 1.1;
+
+pub fn font_zoom() -> f64 {
+    f64::from_bits(FONT_ZOOM_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn set_font_zoom(zoom: f64) -> f64 {
+    let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+    FONT_ZOOM_BITS.store(zoom.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    zoom
+}
+
 /// Creates and configures a terminal widget. Does not spawn the shell —
 /// caller is responsible for spawning so it can capture the child PID.
 pub fn build(cfg: &Config) -> Terminal {
     let terminal = Terminal::new();
 
     apply_config(&terminal, cfg);
+    terminal.set_font_scale(font_zoom());
 
     // Register a URL regex so plain https?:// links get a pointer cursor on hover.
     if let Ok(re) = vte4::Regex::for_match("https?://[^\\s\\])'\">\x01-\x1f]+", 0) {

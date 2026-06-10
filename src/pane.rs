@@ -28,6 +28,7 @@ pub fn split_with(
         paned.set_start_child(Some(focused));
         paned.set_end_child(Some(new_term));
         notebook.insert_page(&paned, label.as_ref(), Some(idx));
+        notebook.set_tab_reorderable(&paned, true);
         notebook.set_current_page(Some(idx));
 
     // Case 2: focused is inside a Paned
@@ -125,6 +126,7 @@ pub fn close_terminal(terminal: &vte4::Terminal, notebook: &gtk4::Notebook) -> b
         let label = notebook.tab_label(&parent_w);
         notebook.remove_page(Some(idx));
         notebook.insert_page(&sibling, label.as_ref(), Some(idx));
+        notebook.set_tab_reorderable(&sibling, true);
         notebook.set_current_page(Some(idx));
     } else if let Some(gp) = parent_w
         .parent()

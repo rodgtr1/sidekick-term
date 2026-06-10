@@ -24,6 +24,14 @@ window.
 - Configurable terminal font, cursor, padding, scrollback, hyperlink behavior,
   bell, and opacity.
 - Shell integration for background tab notification dots.
+- Find in scrollback, app-wide font zoom, drag-reorder and renameable tabs.
+- Session restore: tabs, split layouts, and working directories come back on
+  launch.
+- Desktop notifications and an activity-bar badge when agents are waiting.
+- Run-panel tasks execute in a dedicated split with a live status indicator,
+  optionally opening the embedded browser (inspector enabled) on a URL.
+- Editor follows external file changes (agents editing under you), warns
+  before overwriting newer on-disk content, and saves atomically.
 - Local Unix-socket control commands via `sidekick-ctl`.
 - Optional `sidekick-hook` for showing Claude Code edit diffs inside
   sidekick before accepting or rejecting them.
@@ -124,7 +132,7 @@ terminal tab, based on the `[editor]` configuration.
 | Shortcut | Action |
 |---|---|
 | `Ctrl+Shift+C`, `Ctrl+Insert` | Copy selected terminal text |
-| `Ctrl+V` | Paste clipboard image as a temp PNG path, or paste text if no image is available |
+| `Ctrl+V` | Paste a clipboard image as a temp PNG path; with a text-only clipboard the key reaches the shell (verbatim insert) |
 | `Ctrl+Shift+V`, `Shift+Insert` | Paste text into the focused terminal |
 | `Ctrl+Shift+T` | New terminal tab |
 | `Ctrl+Shift+W` | Close the current pane, editor tab, or diff tab; the final tab stays open |
@@ -134,6 +142,8 @@ terminal tab, based on the `[editor]` configuration.
 | `Ctrl+Shift+X` | Split terminal down |
 | `Alt+Left` | Focus previous terminal pane |
 | `Alt+Right` | Focus next terminal pane |
+| `Ctrl+Shift+H` | Find in scrollback (Enter: next match up, Shift+Enter: down, Esc: close) |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Font zoom in / out / reset (all terminals) |
 | `Ctrl+Shift+E` | Show file explorer panel |
 | `Ctrl+Shift+G` | Show git panel |
 | `Ctrl+F` | Quick open: search file names |
@@ -143,6 +153,9 @@ terminal tab, based on the `[editor]` configuration.
 | `Ctrl+Shift+O` | Toggle embedded browser panel |
 | `Ctrl+,` | Open sidekick config in `nvim` |
 | `Ctrl+S` | Save the current editor tab |
+
+Tabs can be drag-reordered. Right-click a terminal tab label to rename it
+(an empty name resets to the automatic cwd-based title).
 
 ## Configuration
 
@@ -182,12 +195,40 @@ scroll_on_keystroke = true
 allow_hyperlinks = true
 mouse_autohide = true
 audible_bell = false
+# Reopen tabs (and their split layout / directories) from the previous session
+restore_session = true
 
 [editor]
 # builtin | nvim
 file_manager_open = "builtin"
 word_wrap = true
 ```
+
+The session is saved to `~/.local/state/sidekick/session.json` when the
+window closes (and every minute as crash protection). Exiting every shell
+clears the session; launching with `--dir` skips restore for that run.
+
+## Run Panel Tasks
+
+Tasks come from `[[tasks]]` in the global config and from a `.sidekick.toml`
+in the project root. The `→` button types the command into the focused
+terminal; `▶` runs it in a dedicated split below with a live running/done
+indicator, so agent prompts stay clean. A task can also open the embedded
+browser when it starts:
+
+```toml
+[[tasks]]
+name = "dev server"
+cmd  = "npm run dev"
+open_browser = "http://localhost:3000"
+```
+
+The browser panel has the WebKit inspector enabled — right-click →
+"Inspect Element" while previewing whatever your agents are building.
+
+When an agent flips to **waiting** or **finished** while the sidekick window
+is unfocused, a desktop notification is sent, and the activity bar shows a
+badge with the number of agents currently waiting for input.
 
 ## Shell Integration
 

@@ -11,6 +11,11 @@ pub fn build() -> BrowserPanel {
     webview.set_vexpand(true);
     webview.set_hexpand(true);
 
+    // Web inspector (right-click -> Inspect Element) for previewing local apps.
+    if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
+        settings.set_enable_developer_extras(true);
+    }
+
     let back_btn = gtk4::Button::from_icon_name("go-previous-symbolic");
     let fwd_btn = gtk4::Button::from_icon_name("go-next-symbolic");
     let reload_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");

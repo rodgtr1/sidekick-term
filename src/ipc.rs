@@ -216,32 +216,6 @@ fn write_response(writer: &mut std::os::unix::net::UnixStream, resp: &Response) 
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agent_commands_parse_with_and_without_tab() {
-        let c: Command = serde_json::from_str(r#"{"action":"agent_busy","tab":7}"#).unwrap();
-        assert!(matches!(c, Command::AgentBusy { tab: Some(7) }));
-
-        // Older clients omit the tab field entirely.
-        let c: Command = serde_json::from_str(r#"{"action":"agent_ready"}"#).unwrap();
-        assert!(matches!(c, Command::AgentReady { tab: None }));
-    }
-
-    #[test]
-    fn show_diff_size_limit_enforced() {
-        let big = "x".repeat(MAX_DIFF_CONTENT_BYTES + 1);
-        let cmd = Command::ShowDiff {
-            path: "/tmp/f".into(),
-            old: big,
-            new_content: String::new(),
-        };
-        assert!(validate_command(&cmd).is_err());
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn peer_is_current_user(stream: &std::os::unix::net::UnixStream) -> bool {
     let mut cred = libc::ucred {
@@ -273,4 +247,30 @@ fn peer_is_current_user(stream: &std::os::unix::net::UnixStream) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn peer_is_current_user(_stream: &std::os::unix::net::UnixStream) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_commands_parse_with_and_without_tab() {
+        let c: Command = serde_json::from_str(r#"{"action":"agent_busy","tab":7}"#).unwrap();
+        assert!(matches!(c, Command::AgentBusy { tab: Some(7) }));
+
+        // Older clients omit the tab field entirely.
+        let c: Command = serde_json::from_str(r#"{"action":"agent_ready"}"#).unwrap();
+        assert!(matches!(c, Command::AgentReady { tab: None }));
+    }
+
+    #[test]
+    fn show_diff_size_limit_enforced() {
+        let big = "x".repeat(MAX_DIFF_CONTENT_BYTES + 1);
+        let cmd = Command::ShowDiff {
+            path: "/tmp/f".into(),
+            old: big,
+            new_content: String::new(),
+        };
+        assert!(validate_command(&cmd).is_err());
+    }
 }

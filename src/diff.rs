@@ -19,6 +19,7 @@ pub fn open_message(title: &str, path: &str, message: &str, notebook: &gtk4::Not
     let tab_label = gtk4::Label::new(Some(title));
     let page_idx = notebook.n_pages();
     notebook.append_page(&scroll, Some(&tab_label));
+    notebook.set_tab_reorderable(&scroll, true);
     notebook.set_current_page(Some(page_idx));
     view.grab_focus();
 }
@@ -214,6 +215,7 @@ pub fn open(
 
     let page_idx = notebook.n_pages();
     notebook.append_page(&vbox, Some(&tab_label));
+    notebook.set_tab_reorderable(&vbox, true);
     notebook.set_current_page(Some(page_idx));
     view.grab_focus();
 }
@@ -291,6 +293,7 @@ pub fn open_readonly(title: &str, diff_text: &str, notebook: &gtk4::Notebook) {
     let tab_label = gtk4::Label::new(Some(&format!("Δ {}", title)));
     let page_idx = notebook.n_pages();
     notebook.append_page(&scroll, Some(&tab_label));
+    notebook.set_tab_reorderable(&scroll, true);
     notebook.set_current_page(Some(page_idx));
     view.grab_focus();
 }

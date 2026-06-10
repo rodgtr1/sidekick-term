@@ -5,6 +5,9 @@ use std::rc::Rc;
 pub struct GitPanel {
     pub widget: gtk4::Box,
     pub header: gtk4::Label,
+    pub branch_label: gtk4::Label,
+    pub stage_all_btn: gtk4::Button,
+    pub unstage_all_btn: gtk4::Button,
     pub list: gtk4::ListBox,
     pub push_btn: gtk4::Button,
     pub pull_btn: gtk4::Button,
@@ -16,6 +19,29 @@ pub fn build() -> GitPanel {
     let header = gtk4::Label::new(Some("GIT CHANGES"));
     header.set_xalign(0.0);
     header.add_css_class("sidebar-header");
+
+    // Branch + bulk stage row
+    let branch_label = gtk4::Label::new(None);
+    branch_label.set_xalign(0.0);
+    branch_label.set_hexpand(true);
+    branch_label.set_ellipsize(pango::EllipsizeMode::End);
+    branch_label.add_css_class("git-branch-label");
+
+    let stage_all_btn = gtk4::Button::with_label("＋ all");
+    stage_all_btn.add_css_class("run-btn");
+    stage_all_btn.set_tooltip_text(Some("Stage all changes"));
+
+    let unstage_all_btn = gtk4::Button::with_label("− all");
+    unstage_all_btn.add_css_class("run-btn");
+    unstage_all_btn.set_tooltip_text(Some("Unstage all changes"));
+
+    let branch_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    branch_row.set_margin_start(12);
+    branch_row.set_margin_end(8);
+    branch_row.set_margin_bottom(2);
+    branch_row.append(&branch_label);
+    branch_row.append(&stage_all_btn);
+    branch_row.append(&unstage_all_btn);
 
     let list = gtk4::ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::Single);
@@ -70,6 +96,7 @@ pub fn build() -> GitPanel {
 
     let panel = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     panel.append(&header);
+    panel.append(&branch_row);
     panel.append(&list_scroll);
     panel.append(&commit_scroll);
     panel.append(&commit_btn);
@@ -78,6 +105,9 @@ pub fn build() -> GitPanel {
     GitPanel {
         widget: panel,
         header,
+        branch_label,
+        stage_all_btn,
+        unstage_all_btn,
         list,
         push_btn,
         pull_btn,

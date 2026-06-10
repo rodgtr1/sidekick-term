@@ -52,6 +52,7 @@ pub struct BehaviorConfig {
     pub allow_hyperlinks: bool,
     pub mouse_autohide: bool,
     pub audible_bell: bool,
+    pub restore_session: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -105,6 +106,7 @@ impl Default for BehaviorConfig {
             allow_hyperlinks: true,
             mouse_autohide: true,
             audible_bell: false,
+            restore_session: true,
         }
     }
 }
@@ -153,6 +155,8 @@ allow_hyperlinks = true
 # Hide mouse cursor while typing
 mouse_autohide = true
 audible_bell = false
+# Reopen tabs (and their split layout / directories) from the previous session
+restore_session = true
 
 [editor]
 # File manager activation opens files in: builtin | nvim
