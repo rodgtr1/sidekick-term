@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::process::Command;
 use std::process::Stdio;
 
@@ -87,28 +86,31 @@ pub fn changed_files(cwd: &str) -> Vec<GitFile> {
         Some(r) => r,
         None => return vec![],
     };
-    let out = match command_stdout_limited(
-        Command::new("git").args(["-C", &root, "status", "--porcelain=v1", "-u"]),
+    // -z gives NUL-delimited, unquoted paths (porcelain v1 C-quotes paths with
+    // special characters otherwise, which would break abs_path).
+    let out = match crate::limits::command_stdout_limited(
+        Command::new("git").args(["-C", &root, "status", "--porcelain=v1", "-z", "-u"]),
         MAX_GIT_STATUS_BYTES,
+        &[],
+        crate::limits::CapMode::Fail,
     ) {
         Ok(out) => out,
         Err(_) => return vec![],
     };
-    let text = String::from_utf8_lossy(&out);
     let mut files = Vec::new();
-    for line in text.lines() {
-        if line.len() < 4 {
+    let mut records = out.split(|b| *b == 0);
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
             continue;
         }
-        let xy = &line[..2];
-        let rel = line[3..].trim();
-        let rel = if rel.contains(" -> ") {
-            rel.split(" -> ").last().unwrap_or(rel)
-        } else {
-            rel
-        };
-        let x = xy.chars().next().unwrap_or(' ');
-        let y = xy.chars().nth(1).unwrap_or(' ');
+        let x = record[0] as char;
+        let y = record[1] as char;
+        let rel = String::from_utf8_lossy(&record[3..]).to_string();
+        let rel = rel.as_str();
+        // Renames/copies are followed by the origin path as a separate field.
+        if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+            let _origin = records.next();
+        }
 
         if x == '?' && y == '?' {
             files.push(GitFile {
@@ -182,9 +184,11 @@ pub fn file_diff(root: &str, file: &GitFile) -> Result<String, String> {
     } else {
         vec!["-C", root, "diff", "--", &file.rel_path]
     };
-    let bytes = command_stdout_limited(
+    let bytes = crate::limits::command_stdout_limited(
         Command::new("git").args(&args),
         crate::limits::MAX_DIFF_BYTES,
+        &[],
+        crate::limits::CapMode::Fail,
     )?;
     String::from_utf8(bytes).map_err(|_| "Diff is not valid UTF-8 text.".to_string())
 }
@@ -274,37 +278,3 @@ pub fn push(cwd: &str) -> Result<(), String> {
     }
 }
 
-fn command_stdout_limited(command: &mut Command, limit: usize) -> Result<Vec<u8>, String> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not capture command output.".to_string())?;
-    let mut output = Vec::new();
-    let mut buf = [0u8; 8192];
-
-    loop {
-        let read = stdout.read(&mut buf).map_err(|e| e.to_string())?;
-        if read == 0 {
-            break;
-        }
-        output.extend_from_slice(&buf[..read]);
-        if output.len() > limit {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Command output is too large.".to_string());
-        }
-    }
-
-    let status = child.wait().map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(output)
-    } else {
-        Err(format!("Command exited with {status}."))
-    }
-}

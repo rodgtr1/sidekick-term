@@ -3,11 +3,23 @@ use sourceview5::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
+pub type SaveCallback = Rc<dyn Fn(&str)>;
+
 pub fn open_with_save_callback(
     path: &str,
     notebook: &gtk4::Notebook,
     cfg: &crate::config::Config,
-    on_saved: Option<Rc<dyn Fn(&str)>>,
+    on_saved: Option<SaveCallback>,
+) {
+    open_at_line(path, None, notebook, cfg, on_saved);
+}
+
+pub fn open_at_line(
+    path: &str,
+    line: Option<u32>,
+    notebook: &gtk4::Notebook,
+    cfg: &crate::config::Config,
+    on_saved: Option<SaveCallback>,
 ) {
     let filename = crate::limits::display_name(path);
 
@@ -124,4 +136,18 @@ pub fn open_with_save_callback(
     notebook.append_page(&scroll, Some(&label));
     notebook.set_current_page(Some(page_idx));
     view.grab_focus();
+
+    if let Some(line) = line {
+        // Scroll after the view has been laid out; scrolling immediately is a
+        // no-op because line heights are not validated yet.
+        let buf = buffer.clone();
+        let v = view.clone();
+        glib::idle_add_local_once(move || {
+            let mut iter = buf.iter_at_line(line.saturating_sub(1) as i32);
+            if let Some(iter) = iter.as_mut() {
+                buf.place_cursor(iter);
+                v.scroll_to_iter(iter, 0.0, true, 0.0, 0.3);
+            }
+        });
+    }
 }

@@ -85,7 +85,17 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
                 Some(content) => content,
                 None => return vec![],
             };
-            let new_content = file_content.replacen(&old_str, &new_str, 1);
+            // If old_string is not present, the tool call itself will fail —
+            // skip the preview rather than showing a misleading no-op diff.
+            if !file_content.contains(&old_str) {
+                return vec![];
+            }
+            let replace_all = input.tool_input["replace_all"].as_bool().unwrap_or(false);
+            let new_content = if replace_all {
+                file_content.replace(&old_str, &new_str)
+            } else {
+                file_content.replacen(&old_str, &new_str, 1)
+            };
             if new_content.len() > MAX_HOOK_TEXT_BYTES as usize {
                 eprintln!("sidekick-hook: edit too large to preview");
                 std::process::exit(2);
@@ -106,7 +116,17 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
                 for edit in edits {
                     let old_str = edit["old_string"].as_str().unwrap_or("").to_string();
                     let new_str = edit["new_string"].as_str().unwrap_or("").to_string();
-                    current = current.replacen(&old_str, &new_str, 1);
+                    // Any edit that won't apply makes the simulated result
+                    // diverge from what the tool will do — skip the preview.
+                    if !current.contains(&old_str) {
+                        return vec![];
+                    }
+                    let replace_all = edit["replace_all"].as_bool().unwrap_or(false);
+                    current = if replace_all {
+                        current.replace(&old_str, &new_str)
+                    } else {
+                        current.replacen(&old_str, &new_str, 1)
+                    };
                     if current.len() > MAX_HOOK_TEXT_BYTES as usize {
                         eprintln!("sidekick-hook: edit too large to preview");
                         std::process::exit(2);

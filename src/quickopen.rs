@@ -194,30 +194,51 @@ fn search_files(root: &str, query: &str) -> Vec<(String, String)> {
         return vec![];
     }
     let max = MAX_RESULTS.to_string();
+    // Truncating cap: with `find` on a huge tree we keep the first chunk of
+    // results instead of buffering the entire listing in memory.
+    const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
     // Try fd first
-    let out = std::process::Command::new("fd")
-        .args([
-            "--type",
-            "f",
-            "--max-results",
-            &max,
-            "--color",
-            "never",
-            "--",
-            query,
-        ])
-        .current_dir(root)
-        .output();
+    let out = crate::limits::command_stdout_limited(
+        std::process::Command::new("fd")
+            .args([
+                "--type",
+                "f",
+                "--max-results",
+                &max,
+                "--color",
+                "never",
+                "--",
+                query,
+            ])
+            .current_dir(root),
+        MAX_OUTPUT_BYTES,
+        &[1],
+        crate::limits::CapMode::Truncate,
+    );
 
     let raw = match out {
-        Ok(o) if o.status.success() || o.status.code() == Some(1) => o.stdout,
-        _ => match std::process::Command::new("find")
-            .args([".", "-type", "f", "-iname", &format!("*{}*", query)])
-            .current_dir(root)
-            .output()
-        {
-            Ok(o) => o.stdout,
+        Ok(o) => o,
+        Err(_) => match crate::limits::command_stdout_limited(
+            std::process::Command::new("find")
+                .args([
+                    ".",
+                    "-name",
+                    ".git",
+                    "-prune",
+                    "-o",
+                    "-type",
+                    "f",
+                    "-iname",
+                    &format!("*{}*", query),
+                    "-print",
+                ])
+                .current_dir(root),
+            MAX_OUTPUT_BYTES,
+            &[1],
+            crate::limits::CapMode::Truncate,
+        ) {
+            Ok(o) => o,
             Err(_) => return vec![],
         },
     };

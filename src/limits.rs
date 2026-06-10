@@ -34,6 +34,67 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
 
+/// What to do when a child process produces more output than the limit.
+#[derive(Clone, Copy, PartialEq)]
+pub enum CapMode {
+    /// Kill the child and return an error.
+    Fail,
+    /// Kill the child and return the output collected so far.
+    Truncate,
+}
+
+/// Run a command and collect stdout, never holding more than `limit` bytes.
+/// Exit codes listed in `ok_codes` are treated as success (e.g. grep/rg use 1
+/// for "no matches").
+pub fn command_stdout_limited(
+    command: &mut std::process::Command,
+    limit: usize,
+    ok_codes: &[i32],
+    mode: CapMode,
+) -> Result<Vec<u8>, String> {
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not capture command output.".to_string())?;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let read = stdout.read(&mut buf).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buf[..read]);
+        if output.len() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return match mode {
+                CapMode::Fail => Err("Command output is too large.".to_string()),
+                CapMode::Truncate => {
+                    output.truncate(limit);
+                    Ok(output)
+                }
+            };
+        }
+    }
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let code = status.code().unwrap_or(-1);
+    if status.success() || ok_codes.contains(&code) {
+        Ok(output)
+    } else {
+        Err(format!("Command exited with {status}."))
+    }
+}
+
 pub fn display_name(path: &str) -> String {
     Path::new(path)
         .file_name()

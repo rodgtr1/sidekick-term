@@ -1,43 +1,23 @@
-use crate::{config, tab};
 use gtk4::prelude::*;
-use vte4::prelude::*;
 
-pub fn split(
+/// Returns the terminal that a split should attach next to, if any.
+pub fn split_target(
     window: &gtk4::ApplicationWindow,
     notebook: &gtk4::Notebook,
-    cfg: &config::Config,
+) -> Option<vte4::Terminal> {
+    focused_terminal(window, notebook)
+}
+
+/// Insert `new_term` next to `focused` in a new Paned. The caller is
+/// responsible for building, spawning, and wiring `new_term` (agent status,
+/// child-exited handling) so split panes are first-class terminals.
+pub fn split_with(
+    notebook: &gtk4::Notebook,
+    focused: &vte4::Terminal,
+    new_term: &vte4::Terminal,
     orientation: gtk4::Orientation,
 ) {
-    let focused = match focused_terminal(window, notebook) {
-        Some(t) => t,
-        None => return,
-    };
     let focused_w: gtk4::Widget = focused.clone().upcast();
-
-    let new_term = tab::build(cfg);
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    new_term.spawn_async(
-        vte4::PtyFlags::DEFAULT,
-        None,
-        &[shell.as_str()],
-        &[],
-        glib::SpawnFlags::DEFAULT,
-        || {},
-        -1,
-        None::<&gio::Cancellable>,
-        |_| {},
-    );
-    {
-        let nb = notebook.clone();
-        let weak = new_term.downgrade();
-        new_term.connect_child_exited(move |_, _| {
-            if let Some(t) = weak.upgrade() {
-                if close_terminal(&t, &nb) {
-                    std::process::exit(0);
-                }
-            }
-        });
-    }
 
     let paned = gtk4::Paned::new(orientation);
 
@@ -45,8 +25,8 @@ pub fn split(
     if let Some(idx) = notebook.page_num(&focused_w) {
         let label = notebook.tab_label(&focused_w);
         notebook.remove_page(Some(idx));
-        paned.set_start_child(Some(&focused));
-        paned.set_end_child(Some(&new_term));
+        paned.set_start_child(Some(focused));
+        paned.set_end_child(Some(new_term));
         notebook.insert_page(&paned, label.as_ref(), Some(idx));
         notebook.set_current_page(Some(idx));
 
@@ -67,8 +47,8 @@ pub fn split(
             pp.set_end_child(None::<&gtk4::Widget>);
         }
 
-        paned.set_start_child(Some(&focused));
-        paned.set_end_child(Some(&new_term));
+        paned.set_start_child(Some(focused));
+        paned.set_end_child(Some(new_term));
 
         if is_start {
             pp.set_start_child(Some(&paned));

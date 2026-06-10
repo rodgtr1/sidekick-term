@@ -112,28 +112,45 @@ pub fn tab_title_parts(pid: i32) -> (String, String) {
     (short, detail)
 }
 
+/// Returns the cached branch immediately (possibly stale or None) and, when
+/// the cache entry is expired, refreshes it on a background thread. This is
+/// called from the 500ms UI tick, so it must never run git synchronously.
 fn branch_for_cwd(cwd: &str) -> Option<String> {
     let cache = BRANCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let now = Instant::now();
-    if let Ok(cache) = cache.lock() {
-        if let Some((checked_at, branch)) = cache.get(cwd) {
-            if now.duration_since(*checked_at) < BRANCH_CACHE_TTL {
-                return branch.clone();
-            }
+
+    let (cached, needs_refresh) = match cache.lock() {
+        Ok(cache) => match cache.get(cwd) {
+            Some((checked_at, branch)) => (
+                branch.clone(),
+                now.duration_since(*checked_at) >= BRANCH_CACHE_TTL,
+            ),
+            None => (None, true),
+        },
+        Err(_) => return None,
+    };
+
+    if needs_refresh {
+        // Stamp the entry now so concurrent ticks don't spawn duplicate threads.
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(cwd.to_string(), (now, cached.clone()));
         }
+        let cwd = cwd.to_string();
+        std::thread::spawn(move || {
+            let branch = std::process::Command::new("git")
+                .args(["-C", &cwd, "branch", "--show-current"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let cache = BRANCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Ok(mut cache) = cache.lock() {
+                cache.insert(cwd, (Instant::now(), branch));
+            }
+        });
     }
 
-    let branch = std::process::Command::new("git")
-        .args(["-C", cwd, "branch", "--show-current"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(cwd.to_string(), (now, branch.clone()));
-    }
-    branch
+    cached
 }

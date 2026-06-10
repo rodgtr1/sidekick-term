@@ -19,10 +19,22 @@ pub enum Command {
         #[serde(rename = "new")]
         new_content: String,
     },
-    AgentBusy,
-    AgentReady,
-    AgentDone,
-    AgentIdle,
+    AgentBusy {
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    AgentReady {
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    AgentDone {
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    AgentIdle {
+        #[serde(default)]
+        tab: Option<u64>,
+    },
 }
 
 #[derive(Serialize)]
@@ -201,6 +213,32 @@ fn validate_command(command: &Command) -> Result<(), String> {
 fn write_response(writer: &mut std::os::unix::net::UnixStream, resp: &Response) {
     if let Ok(json) = serde_json::to_string(resp) {
         let _ = writeln!(writer, "{json}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_commands_parse_with_and_without_tab() {
+        let c: Command = serde_json::from_str(r#"{"action":"agent_busy","tab":7}"#).unwrap();
+        assert!(matches!(c, Command::AgentBusy { tab: Some(7) }));
+
+        // Older clients omit the tab field entirely.
+        let c: Command = serde_json::from_str(r#"{"action":"agent_ready"}"#).unwrap();
+        assert!(matches!(c, Command::AgentReady { tab: None }));
+    }
+
+    #[test]
+    fn show_diff_size_limit_enforced() {
+        let big = "x".repeat(MAX_DIFF_CONTENT_BYTES + 1);
+        let cmd = Command::ShowDiff {
+            path: "/tmp/f".into(),
+            old: big,
+            new_content: String::new(),
+        };
+        assert!(validate_command(&cmd).is_err());
     }
 }
 

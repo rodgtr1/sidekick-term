@@ -3,13 +3,24 @@ use std::os::unix::net::UnixStream;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Agent commands carry the tab id (injected into each shell's environment
+    // by sidekick) so the status lands on the terminal the hook ran in, not
+    // whichever tab happens to be focused.
+    let tab = std::env::var("SIDEKICK_TAB_ID")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let agent_payload = |action: &str| match tab {
+        Some(id) => format!(r#"{{"action":"{action}","tab":{id}}}"#),
+        None => format!(r#"{{"action":"{action}"}}"#),
+    };
+
     let payload = match args.get(1).map(|s| s.as_str()) {
-        Some("ping") => r#"{"action":"ping"}"#,
-        Some("new-tab") => r#"{"action":"new_tab"}"#,
-        Some("agent-busy") => r#"{"action":"agent_busy"}"#,
-        Some("agent-ready") => r#"{"action":"agent_ready"}"#,
-        Some("agent-done") => r#"{"action":"agent_done"}"#,
-        Some("agent-idle") => r#"{"action":"agent_idle"}"#,
+        Some("ping") => r#"{"action":"ping"}"#.to_string(),
+        Some("new-tab") => r#"{"action":"new_tab"}"#.to_string(),
+        Some("agent-busy") => agent_payload("agent_busy"),
+        Some("agent-ready") => agent_payload("agent_ready"),
+        Some("agent-done") => agent_payload("agent_done"),
+        Some("agent-idle") => agent_payload("agent_idle"),
         _ => {
             eprintln!(
                 "Usage: sidekick-ctl <ping|new-tab|agent-busy|agent-ready|agent-done|agent-idle>"

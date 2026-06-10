@@ -123,7 +123,6 @@ terminal tab, based on the `[editor]` configuration.
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+W` | Close sidekick |
 | `Ctrl+Shift+C`, `Ctrl+Insert` | Copy selected terminal text |
 | `Ctrl+V` | Paste clipboard image as a temp PNG path, or paste text if no image is available |
 | `Ctrl+Shift+V`, `Shift+Insert` | Paste text into the focused terminal |
@@ -249,6 +248,13 @@ Open a new tab in the running instance:
 ```bash
 sidekick-ctl new-tab
 ```
+
+Agent status commands (`agent-busy`, `agent-ready`, `agent-done`,
+`agent-idle`) read `SIDEKICK_TAB_ID` from the environment. sidekick exports
+this variable into every shell it spawns, so a hook or script run inside a
+sidekick terminal updates that terminal's tab indicator — not whichever tab
+happens to be focused. Outside a sidekick shell the variable is absent and
+the update falls back to the focused terminal.
 
 ## Claude Code Hook
 

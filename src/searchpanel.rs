@@ -2,6 +2,15 @@ use gtk4::prelude::*;
 
 const MAX_MATCHES_PER_FILE: usize = 5;
 const MAX_FILES: usize = 50;
+const MAX_SEARCH_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Separator between line number and path in row widget names. Newlines
+/// cannot appear in paths, unlike ':'.
+pub const ROW_NAME_SEP: char = '\n';
+
+pub fn row_name(line: u32, abs_path: &str) -> String {
+    format!("{}{}{}", line, ROW_NAME_SEP, abs_path)
+}
 
 #[derive(Clone)]
 pub struct FileMatches {
@@ -47,22 +56,15 @@ pub fn populate(list: &gtk4::ListBox, files: &[FileMatches]) {
     }
 
     if files.is_empty() {
-        let row = gtk4::ListBoxRow::new();
-        let label = gtk4::Label::new(Some("No results"));
-        label.set_margin_top(8);
-        label.set_margin_bottom(8);
-        label.add_css_class("sidebar-header");
-        row.set_child(Some(&label));
-        row.set_activatable(false);
-        row.set_selectable(false);
-        list.insert(&row, -1);
+        show_message(list, "No results");
         return;
     }
 
     for file in files {
-        // File header row — clicking opens the file
+        // File header row — clicking opens the file at the first match
         let header_row = gtk4::ListBoxRow::new();
-        header_row.set_widget_name(&file.abs_path);
+        let first_line = file.lines.first().map(|(n, _)| *n).unwrap_or(0);
+        header_row.set_widget_name(&row_name(first_line, &file.abs_path));
 
         let count_str = if file.capped {
             format!("{}+", file.lines.len())
@@ -83,7 +85,7 @@ pub fn populate(list: &gtk4::ListBox, files: &[FileMatches]) {
         // Individual match rows
         for (line_num, text) in &file.lines {
             let match_row = gtk4::ListBoxRow::new();
-            match_row.set_widget_name(&file.abs_path);
+            match_row.set_widget_name(&row_name(*line_num, &file.abs_path));
 
             let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
             hbox.set_margin_start(20);
@@ -110,34 +112,77 @@ pub fn populate(list: &gtk4::ListBox, files: &[FileMatches]) {
     }
 }
 
+/// Clear the list and show a single non-interactive message row.
+pub fn show_message(list: &gtk4::ListBox, text: &str) {
+    while let Some(row) = list.row_at_index(0) {
+        list.remove(&row);
+    }
+    let row = gtk4::ListBoxRow::new();
+    let label = gtk4::Label::new(Some(text));
+    label.set_margin_top(8);
+    label.set_margin_bottom(8);
+    label.set_margin_start(8);
+    label.set_margin_end(8);
+    label.set_wrap(true);
+    label.set_xalign(0.0);
+    label.add_css_class("sidebar-header");
+    row.set_child(Some(&label));
+    row.set_activatable(false);
+    row.set_selectable(false);
+    list.insert(&row, -1);
+}
+
 pub fn run_search(root: &str, query: &str) -> Vec<FileMatches> {
     if query.trim().is_empty() {
         return vec![];
     }
 
     let max = MAX_MATCHES_PER_FILE.to_string();
-    let rg = std::process::Command::new("rg")
-        .args([
-            "--line-number",
-            "--color=never",
-            "--max-count",
-            &max,
-            "--",
-            query,
-        ])
-        .current_dir(root)
-        .output();
+    // --fixed-strings: the sidebar searches literally; a query like "foo("
+    // must not be treated as a (broken) regex. Output is capped and truncated
+    // so a huge repo cannot balloon memory.
+    let rg = crate::limits::command_stdout_limited(
+        std::process::Command::new("rg")
+            .args([
+                "--line-number",
+                "--color=never",
+                "--fixed-strings",
+                "--max-count",
+                &max,
+                "--",
+                query,
+            ])
+            .current_dir(root),
+        MAX_SEARCH_OUTPUT_BYTES,
+        &[1], // 1 = no matches
+        crate::limits::CapMode::Truncate,
+    );
 
     let raw = match rg {
-        Ok(out) if out.status.success() || out.status.code() == Some(1) => out.stdout,
-        _ => {
-            // rg not available, fall back to grep
-            match std::process::Command::new("grep")
-                .args(["-rn", "--color=never", "-m", &max, "--", query, "."])
-                .current_dir(root)
-                .output()
-            {
-                Ok(out) => out.stdout,
+        Ok(out) => out,
+        Err(_) => {
+            // rg not available — fall back to grep, skipping binary files and
+            // the usual junk directories rg's gitignore handling would skip.
+            match crate::limits::command_stdout_limited(
+                std::process::Command::new("grep")
+                    .args([
+                        "-rnIF",
+                        "--color=never",
+                        "--exclude-dir=.git",
+                        "--exclude-dir=node_modules",
+                        "--exclude-dir=target",
+                        "-m",
+                        &max,
+                        "--",
+                        query,
+                        ".",
+                    ])
+                    .current_dir(root),
+                MAX_SEARCH_OUTPUT_BYTES,
+                &[1],
+                crate::limits::CapMode::Truncate,
+            ) {
+                Ok(out) => out,
                 Err(_) => return vec![],
             }
         }
@@ -158,6 +203,12 @@ pub fn run_search(root: &str, query: &str) -> Vec<FileMatches> {
         };
         let content = parts.next().unwrap_or("").to_string();
 
+        // Stop only when a *new* file would exceed the cap, so the last
+        // included file still gets all of its matches.
+        if map.len() >= MAX_FILES && !map.contains_key(&rel) {
+            break;
+        }
+
         let abs = format!("{}/{}", root, rel);
         let entry = map.entry(rel.clone()).or_insert_with(|| FileMatches {
             abs_path: abs,
@@ -168,10 +219,6 @@ pub fn run_search(root: &str, query: &str) -> Vec<FileMatches> {
         entry.lines.push((line_num, content));
         if entry.lines.len() == MAX_MATCHES_PER_FILE {
             entry.capped = true;
-        }
-
-        if map.len() >= MAX_FILES {
-            break;
         }
     }
 
