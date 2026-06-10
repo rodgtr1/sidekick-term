@@ -13,6 +13,7 @@ mod runpanel;
 mod scrollsearch;
 mod searchpanel;
 mod session;
+mod shortcutshelp;
 mod tab;
 mod theme;
 
@@ -1042,6 +1043,11 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                         root.remove(&scroll);
                     }
                     scroll.set_visible(visible);
+                    glib::Propagation::Stop
+                }
+                // Keyboard shortcuts help
+                (true, true, false, gdk::Key::question | gdk::Key::slash) => {
+                    shortcutshelp::show(&win);
                     glib::Propagation::Stop
                 }
                 // Toggle browser panel
@@ -2943,6 +2949,29 @@ fn build_css(cfg: &config::Config) -> String {
         }}
         .quickopen-path {{
             color: #6c7086;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+
+        .shortcuts-title {{
+            color: #cdd6f4;
+            font-family: {font};
+            font-size: {fsize}pt;
+            font-weight: bold;
+        }}
+        .shortcuts-section {{
+            color: #89b4fa;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+            font-weight: bold;
+        }}
+        .shortcuts-keys {{
+            color: #f9e2af;
+            font-family: {font};
+            font-size: {sidebar_pt}pt;
+        }}
+        .shortcuts-action {{
+            color: #cdd6f4;
             font-family: {font};
             font-size: {sidebar_pt}pt;
         }}
