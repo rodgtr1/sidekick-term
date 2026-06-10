@@ -34,6 +34,10 @@ use webkit6::prelude::WebViewExt as _;
 
 const APP_ID: &str = "com.travismedia.sidekick";
 const AGENT_STATUS_TERMPROP: &str = "vte.ext.sidekick.agent";
+const CMD_EXIT_TERMPROP: &str = "vte.ext.sidekick.exit";
+/// Commands that ran at least this long trigger a desktop notification on
+/// finish when the window is unfocused.
+const LONG_COMMAND_NOTIFY_SECS: u64 = 15;
 const SIDE_RAIL_WIDTH: i32 = 220;
 const TOOL_PANEL_WIDTH: i32 = SIDE_RAIL_WIDTH - 1;
 const NOTEBOOK_TAB_WIDTH: i32 = SIDE_RAIL_WIDTH - 3;
@@ -2617,6 +2621,46 @@ fn notify_agent_attention(
     app.send_notification(Some(&format!("sidekick-agent-{key}")), &notification);
 }
 
+/// Desktop notification when a long-running command finishes while the
+/// window is unfocused. Exit code comes from the shell-integration termprop;
+/// without it the notification still fires, just without a failure marker.
+fn notify_long_command_finished(terminal: &vte4::Terminal, duration: Duration) {
+    let Some(window) = terminal
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+    else {
+        return;
+    };
+    if window.is_active() {
+        return;
+    }
+    let Some(app) = window.application() else {
+        return;
+    };
+    let (exit_value, _) = terminal.termprop_string(CMD_EXIT_TERMPROP);
+    let exit_code = exit_value.as_ref().and_then(|v| v.as_str().parse::<i32>().ok());
+    let summary = match exit_code {
+        Some(code) if code != 0 => format!("Command failed (exit {code})"),
+        _ => "Command finished".to_string(),
+    };
+    let place = terminal_cwd(terminal)
+        .map(|cwd| {
+            std::path::Path::new(&cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or(cwd)
+        })
+        .unwrap_or_default();
+    let notification = gio::Notification::new(&summary);
+    notification.set_body(Some(&format!(
+        "{} — {place}",
+        agentpanel::format_elapsed(duration.as_secs())
+    )));
+    // One notification id per terminal so updates replace instead of stack.
+    let key = terminal.as_ptr() as usize;
+    app.send_notification(Some(&format!("sidekick-cmd-{key}")), &notification);
+}
+
 fn set_agent_state(
     window: &ApplicationWindow,
     notebook: &Notebook,
@@ -2651,12 +2695,24 @@ fn wire_agent_state_handlers(
     agent_state: &AgentCell,
     dirty_ctx: Option<(Rc<Cell<bool>>, Notebook)>,
 ) {
+    // When the last command started, for long-command notifications.
+    let command_started: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
     {
         let agent_c = Rc::clone(agent_state);
         let term_c = terminal.clone();
+        let started_c = Rc::clone(&command_started);
         terminal.connect_termprop_changed(Some("vte.shell.precmd"), move |_, _| {
+            // Explicit agent hooks already notify on Busy -> Done; skip the
+            // long-command notification for those to avoid doubling up.
+            let was_explicit_busy = matches!(agent_c.get(), AgentState::Busy);
             if matches!(agent_c.get(), AgentState::AutoBusy | AgentState::Busy) {
                 agent_c.set(AgentState::Done);
+            }
+            if let Some(started) = started_c.take() {
+                let duration = started.elapsed();
+                if !was_explicit_busy && duration.as_secs() >= LONG_COMMAND_NOTIFY_SECS {
+                    notify_long_command_finished(&term_c, duration);
+                }
             }
             if let Some((dirty, nb)) = &dirty_ctx {
                 if dirty.get() {
@@ -2673,7 +2729,9 @@ fn wire_agent_state_handlers(
     }
     {
         let agent_c = Rc::clone(agent_state);
+        let started_c = Rc::clone(&command_started);
         terminal.connect_termprop_changed(Some("vte.shell.preexec"), move |_, _| {
+            started_c.set(Some(Instant::now()));
             if matches!(
                 agent_c.get(),
                 AgentState::Idle | AgentState::Ready | AgentState::Done
@@ -2938,15 +2996,17 @@ fn agent_state_from_status(status: &str) -> Option<AgentState> {
 }
 
 fn install_agent_status_termprop() {
-    let Ok(name) = CString::new(AGENT_STATUS_TERMPROP) else {
-        return;
-    };
-    unsafe {
-        vte4::ffi::vte_install_termprop(
-            name.as_ptr(),
-            vte4::ffi::VTE_PROPERTY_STRING,
-            vte4::ffi::VTE_PROPERTY_FLAG_NONE,
-        );
+    for prop in [AGENT_STATUS_TERMPROP, CMD_EXIT_TERMPROP] {
+        let Ok(name) = CString::new(prop) else {
+            continue;
+        };
+        unsafe {
+            vte4::ffi::vte_install_termprop(
+                name.as_ptr(),
+                vte4::ffi::VTE_PROPERTY_STRING,
+                vte4::ffi::VTE_PROPERTY_FLAG_NONE,
+            );
+        }
     }
 }
 

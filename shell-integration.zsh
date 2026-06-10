@@ -7,6 +7,10 @@
 #   source ~/.config/sidekick/shell-integration.zsh
 
 _sidekick_precmd() {
+    local code="$?"
+    # Exit status of the command that just finished — read by sidekick at
+    # precmd time for long-command desktop notifications.
+    printf '\033]666;vte.ext.sidekick.exit=%s\033\\' "$code"
     # VTE OSC 666: signal vte.shell.precmd (shell is about to show the prompt)
     printf '\033]666;vte.shell.precmd!\033\\'
 }
