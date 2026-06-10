@@ -6,6 +6,7 @@ mod editor;
 mod filetree;
 mod git;
 mod gitpanel;
+mod hostspanel;
 mod ipc;
 mod limits;
 mod palette;
@@ -189,6 +190,9 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     // Agents dashboard panel
     let agent_panel = Rc::new(agentpanel::build());
 
+    // Hosts panel (ssh config + teleport)
+    let hosts_panel = hostspanel::build();
+
     // File tree page (header + scroll stacked vertically)
     let files_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     files_page.append(&tree_header);
@@ -203,6 +207,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     panel_stack.add_named(&search_panel, Some("search"));
     panel_stack.add_named(&run_panel, Some("run"));
     panel_stack.add_named(&agent_panel.widget, Some("agents"));
+    panel_stack.add_named(&hosts_panel.widget, Some("hosts"));
 
     // Activity bar: narrow icon strip on the far left
     let activity_bar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -244,11 +249,19 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     btn_agents.set_child(Some(&img_agents));
     btn_agents.set_tooltip_text(Some("Agents (Ctrl+Shift+A)"));
 
+    let btn_hosts = gtk4::Button::new();
+    btn_hosts.add_css_class("activity-btn");
+    let img_hosts = gtk4::Image::from_icon_name("network-server-symbolic");
+    img_hosts.set_pixel_size(20);
+    btn_hosts.set_child(Some(&img_hosts));
+    btn_hosts.set_tooltip_text(Some("Hosts"));
+
     activity_bar.append(&btn_files);
     activity_bar.append(&btn_git);
     activity_bar.append(&btn_search);
     activity_bar.append(&btn_run);
     activity_bar.append(&btn_agents);
+    activity_bar.append(&btn_hosts);
 
     // Badge at the bottom of the activity bar: count of agents waiting for input.
     let badge_spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -815,6 +828,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         btn_search.clone(),
         btn_run.clone(),
         btn_agents.clone(),
+        btn_hosts.clone(),
     ];
     let switch_panel: Rc<dyn Fn(&'static str, usize)> = Rc::new({
         let stack = panel_stack.clone();
@@ -952,6 +966,18 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 panel.populate(&rows);
             }
             glib::ControlFlow::Continue
+        });
+    }
+    // Hosts panel: open a new tab running the row's ssh / tsh command.
+    {
+        let nb = notebook.clone();
+        let cfg_h = Rc::clone(&cfg);
+        let agent_map_h = Rc::clone(&agent_map);
+        hosts_panel.list.connect_row_activated(move |_, row| {
+            let command = row.widget_name().to_string();
+            if !command.is_empty() {
+                add_tab_with_command(&nb, &cfg_h.borrow(), None, &agent_map_h, Some(command));
+            }
         });
     }
     {
@@ -1387,6 +1413,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         (btn_search.clone(), "search"),
         (btn_run.clone(), "run"),
         (btn_agents.clone(), "agents"),
+        (btn_hosts.clone(), "hosts"),
     ]
     .into_iter()
     .enumerate()
@@ -1661,6 +1688,16 @@ fn build_palette_actions(ctx: PaletteContext<'_>) -> Rc<Vec<palette::Action>> {
                         e.grab_focus();
                     });
                 }
+            }),
+        );
+    }
+    {
+        let sp = Rc::clone(ctx.switch_panel);
+        push(
+            "Show Hosts Panel",
+            None,
+            Rc::new(move || {
+                sp("hosts", 5);
             }),
         );
     }
