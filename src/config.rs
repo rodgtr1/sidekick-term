@@ -171,7 +171,14 @@ word_wrap = true
 "#;
 
 impl Config {
+    /// Startup load: never fails, falls back to defaults on any error.
     pub fn load() -> Self {
+        Self::load_checked().unwrap_or_default()
+    }
+
+    /// Load returning an error for malformed TOML, so reloads can keep the
+    /// previous in-memory config instead of silently resetting to defaults.
+    pub fn load_checked() -> Result<Self, String> {
         let path = config_path();
 
         if !path.exists() {
@@ -179,16 +186,16 @@ impl Config {
                 let _ = fs::create_dir_all(parent);
             }
             let _ = fs::write(&path, DEFAULT_CONFIG);
-            return Self::default();
+            return Ok(Self::default());
         }
 
-        let content = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => return Self::default(),
-        };
-
-        toml::from_str(&content).unwrap_or_default()
+        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        parse_config(&content)
     }
+}
+
+pub fn parse_config(content: &str) -> Result<Config, String> {
+    toml::from_str(content).map_err(|e| e.to_string())
 }
 
 pub fn config_path() -> PathBuf {
@@ -199,4 +206,20 @@ pub fn config_path() -> PathBuf {
             PathBuf::from(home).join(".config")
         });
     config_dir.join("sidekick").join("config.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_config() {
+        let cfg = parse_config("[font]\nsize = 20\n").expect("valid");
+        assert_eq!(cfg.font.size, 20);
+    }
+
+    #[test]
+    fn invalid_config_is_err() {
+        assert!(parse_config("this is = = not toml").is_err());
+    }
 }
