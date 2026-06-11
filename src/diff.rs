@@ -112,10 +112,15 @@ pub fn open(
     }
 
     buffer.set_text(&text);
-    for (start_byte, end_byte, tag_name) in spans {
-        let start_iter =
-            buffer.iter_at_offset(byte_offset_to_char_offset(&text, start_byte) as i32);
-        let end_iter = buffer.iter_at_offset(byte_offset_to_char_offset(&text, end_byte) as i32);
+    let mut boundaries = Vec::with_capacity(spans.len() * 2);
+    for (s, e, _) in &spans {
+        boundaries.push(*s);
+        boundaries.push(*e);
+    }
+    let chars = char_offsets(&text, &boundaries);
+    for (i, (_, _, tag_name)) in spans.iter().enumerate() {
+        let start_iter = buffer.iter_at_offset(chars[i * 2] as i32);
+        let end_iter = buffer.iter_at_offset(chars[i * 2 + 1] as i32);
         buffer.apply_tag_by_name(tag_name, &start_iter, &end_iter);
     }
 
@@ -273,9 +278,15 @@ pub fn open_readonly(title: &str, diff_text: &str, notebook: &gtk4::Notebook) {
     }
 
     buffer.set_text(&text);
-    for (sb, eb, tag) in spans {
-        let si = buffer.iter_at_offset(byte_offset_to_char_offset(&text, sb) as i32);
-        let ei = buffer.iter_at_offset(byte_offset_to_char_offset(&text, eb) as i32);
+    let mut boundaries = Vec::with_capacity(spans.len() * 2);
+    for (s, e, _) in &spans {
+        boundaries.push(*s);
+        boundaries.push(*e);
+    }
+    let chars = char_offsets(&text, &boundaries);
+    for (i, (_, _, tag)) in spans.iter().enumerate() {
+        let si = buffer.iter_at_offset(chars[i * 2] as i32);
+        let ei = buffer.iter_at_offset(chars[i * 2 + 1] as i32);
         buffer.apply_tag_by_name(tag, &si, &ei);
     }
 
@@ -298,6 +309,42 @@ pub fn open_readonly(title: &str, diff_text: &str, notebook: &gtk4::Notebook) {
     view.grab_focus();
 }
 
-fn byte_offset_to_char_offset(s: &str, byte_offset: usize) -> usize {
-    s[..byte_offset.min(s.len())].chars().count()
+/// Convert a list of byte offsets into char offsets in a single pass.
+/// `byte_offsets` must be non-decreasing (diff spans are emitted in order).
+fn char_offsets(text: &str, byte_offsets: &[usize]) -> Vec<usize> {
+    let mut result = Vec::with_capacity(byte_offsets.len());
+    let mut cur_byte = 0usize;
+    let mut cur_char = 0usize;
+    for &b in byte_offsets {
+        let b = b.min(text.len());
+        if b >= cur_byte {
+            cur_char += text[cur_byte..b].chars().count();
+        } else {
+            // Out-of-order fallback (not expected): recompute from start.
+            cur_char = text[..b].chars().count();
+        }
+        cur_byte = b;
+        result.push(cur_char);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::char_offsets;
+
+    fn naive(text: &str, b: usize) -> usize {
+        text[..b.min(text.len())].chars().count()
+    }
+
+    #[test]
+    fn char_offsets_matches_naive_with_multibyte() {
+        // Byte offsets must fall on char boundaries (as real diff spans do).
+        // "héllo\n" = h é(2 bytes) l l o \n  -> boundaries at 0,1,3,4,5,6,7
+        let text = "héllo\nwörld\n€nd\n";
+        let bytes = vec![0, 1, 3, 6, 7, text.len()];
+        let got = char_offsets(text, &bytes);
+        let want: Vec<usize> = bytes.iter().map(|&b| naive(text, b)).collect();
+        assert_eq!(got, want);
+    }
 }
