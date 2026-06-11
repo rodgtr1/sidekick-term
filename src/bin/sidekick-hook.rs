@@ -15,6 +15,11 @@ struct HookInput {
 }
 
 fn socket_path() -> std::path::PathBuf {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime.is_empty() {
+            return std::path::PathBuf::from(runtime).join("sidekick/sidekick.sock");
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     std::path::PathBuf::from(home).join(".local/run/sidekick.sock")
 }
@@ -68,8 +73,8 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
                 return vec![];
             }
             if new.len() > MAX_HOOK_TEXT_BYTES as usize {
-                eprintln!("sidekick-hook: edit too large to preview");
-                std::process::exit(2);
+                eprintln!("sidekick-hook: edit too large to preview, allowing without preview");
+                return vec![];
             }
             let old = read_existing_text_limited(&path).unwrap_or_default();
             vec![(path, old, new)]
@@ -97,8 +102,8 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
                 file_content.replacen(&old_str, &new_str, 1)
             };
             if new_content.len() > MAX_HOOK_TEXT_BYTES as usize {
-                eprintln!("sidekick-hook: edit too large to preview");
-                std::process::exit(2);
+                eprintln!("sidekick-hook: edit too large to preview, allowing without preview");
+                return vec![];
             }
             vec![(path, file_content, new_content)]
         }
@@ -128,8 +133,10 @@ fn extract_edits(input: &HookInput) -> Vec<(String, String, String)> {
                         current.replacen(&old_str, &new_str, 1)
                     };
                     if current.len() > MAX_HOOK_TEXT_BYTES as usize {
-                        eprintln!("sidekick-hook: edit too large to preview");
-                        std::process::exit(2);
+                        eprintln!(
+                            "sidekick-hook: edit too large to preview, allowing without preview"
+                        );
+                        return vec![];
                     }
                 }
             }
