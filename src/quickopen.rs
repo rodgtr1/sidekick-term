@@ -204,6 +204,7 @@ fn search_files(root: &str, query: &str) -> Vec<(String, String)> {
             .args([
                 "--type",
                 "f",
+                "--fixed-strings",
                 "--max-results",
                 &max,
                 "--color",
