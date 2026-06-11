@@ -11,9 +11,20 @@ pub enum Node {
     Split {
         /// "h" = side by side, "v" = stacked.
         orientation: String,
+        /// Divider position as a fraction (0.0–1.0) of the split's size.
+        #[serde(default)]
+        ratio: Option<f64>,
         first: Box<Node>,
         second: Box<Node>,
     },
+}
+
+/// One restored tab: an optional custom name plus its terminal/split layout.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TabLayout {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub root: Node,
 }
 
 impl Node {
@@ -29,7 +40,7 @@ impl Node {
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Session {
     #[serde(default)]
-    pub tabs: Vec<Node>,
+    pub tabs: Vec<TabLayout>,
 }
 
 pub fn state_path() -> PathBuf {
@@ -74,24 +85,31 @@ mod tests {
     fn session_roundtrips() {
         let session = Session {
             tabs: vec![
-                Node::Terminal { cwd: "/tmp".into() },
-                Node::Split {
-                    orientation: "h".into(),
-                    first: Box::new(Node::Terminal { cwd: "/a".into() }),
-                    second: Box::new(Node::Split {
-                        orientation: "v".into(),
-                        first: Box::new(Node::Terminal { cwd: "/b".into() }),
-                        second: Box::new(Node::Terminal { cwd: "/c".into() }),
-                    }),
+                TabLayout {
+                    name: Some("build".into()),
+                    root: Node::Terminal { cwd: "/tmp".into() },
+                },
+                TabLayout {
+                    name: None,
+                    root: Node::Split {
+                        orientation: "h".into(),
+                        ratio: Some(0.4),
+                        first: Box::new(Node::Terminal { cwd: "/a".into() }),
+                        second: Box::new(Node::Terminal { cwd: "/b".into() }),
+                    },
                 },
             ],
         };
         let json = serde_json::to_string(&session).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tabs.len(), 2);
-        assert_eq!(back.tabs[1].first_cwd(), "/a");
-        match &back.tabs[1] {
-            Node::Split { second, .. } => assert_eq!(second.first_cwd(), "/b"),
+        assert_eq!(back.tabs[0].name.as_deref(), Some("build"));
+        assert_eq!(back.tabs[0].root.first_cwd(), "/tmp");
+        match &back.tabs[1].root {
+            Node::Split { ratio, second, .. } => {
+                assert_eq!(*ratio, Some(0.4));
+                assert_eq!(second.first_cwd(), "/b");
+            }
             _ => panic!("expected split"),
         }
     }

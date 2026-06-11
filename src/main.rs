@@ -196,6 +196,9 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     // Per-terminal agent state: key = terminal widget pointer as usize
     let agent_map: AgentMap = Rc::new(RefCell::new(HashMap::new()));
 
+    // tab id -> custom tab name (for session persistence).
+    let tab_names: Rc<RefCell<HashMap<u64, String>>> = Rc::new(RefCell::new(HashMap::new()));
+
     // Search panel
     let (search_panel, search_entry, search_list) = searchpanel::build();
     let search_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
@@ -348,9 +351,15 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     // specific directory or disabled restore.
     let restored = initial_dir.is_none()
         && cfg.borrow().behavior.restore_session
-        && restore_session(&notebook, &cfg.borrow(), &agent_map);
+        && restore_session(&notebook, &cfg.borrow(), &agent_map, &tab_names);
     if !restored {
-        add_tab(&notebook, &cfg.borrow(), initial_dir, &agent_map);
+        add_tab(
+            &notebook,
+            &cfg.borrow(),
+            initial_dir,
+            &agent_map,
+            &tab_names,
+        );
     }
 
     let css = gtk4::CssProvider::new();
@@ -407,15 +416,19 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     // Persist the session on close and periodically (crash safety).
     {
         let nb = notebook.clone();
+        let agent_map_s = Rc::clone(&agent_map);
+        let tab_names_s = Rc::clone(&tab_names);
         window.connect_close_request(move |_| {
-            session::save(&snapshot_session(&nb));
+            session::save(&snapshot_session(&nb, &agent_map_s, &tab_names_s));
             glib::Propagation::Proceed
         });
     }
     {
         let nb = notebook.clone();
+        let agent_map_s = Rc::clone(&agent_map);
+        let tab_names_s = Rc::clone(&tab_names);
         glib::timeout_add_seconds_local(60, move || {
-            session::save(&snapshot_session(&nb));
+            session::save(&snapshot_session(&nb, &agent_map_s, &tab_names_s));
             glib::ControlFlow::Continue
         });
     }
@@ -978,6 +991,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         search_entry: &search_entry,
         toggle_sidebar: &toggle_sidebar,
         toggle_browser: &toggle_browser,
+        tab_names: &tab_names,
     });
 
     // Agents dashboard: refresh rows every second, jump to a tab on click.
@@ -1052,10 +1066,18 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         let nb = notebook.clone();
         let cfg_h = Rc::clone(&cfg);
         let agent_map_h = Rc::clone(&agent_map);
+        let tab_names_h = Rc::clone(&tab_names);
         hosts_panel.list.connect_row_activated(move |_, row| {
             let command = row.widget_name().to_string();
             if !command.is_empty() {
-                add_tab_with_command(&nb, &cfg_h.borrow(), None, &agent_map_h, Some(command));
+                add_tab_with_command(
+                    &nb,
+                    &cfg_h.borrow(),
+                    None,
+                    &agent_map_h,
+                    &tab_names_h,
+                    Some(command),
+                );
             }
         });
     }
@@ -1085,6 +1107,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         let last_cwd_qo = Rc::clone(&last_cwd);
         let cfg_qo = Rc::clone(&cfg);
         let agent_map_kb = Rc::clone(&agent_map);
+        let tab_names_kb = Rc::clone(&tab_names);
         let on_saved_k = Rc::clone(&on_editor_saved);
         let toggle_sidebar_k = Rc::clone(&toggle_sidebar);
         let toggle_browser_k = Rc::clone(&toggle_browser);
@@ -1141,7 +1164,13 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 // New tab
                 (true, true, false, gdk::Key::t | gdk::Key::T) => {
                     let cwd = focused_terminal_cwd(&win, &nb);
-                    add_tab(&nb, &cfg.borrow(), cwd.as_deref(), &agent_map_kb);
+                    add_tab(
+                        &nb,
+                        &cfg.borrow(),
+                        cwd.as_deref(),
+                        &agent_map_kb,
+                        &tab_names_kb,
+                    );
                     glib::Propagation::Stop
                 }
                 // Close pane / tab (also closes editor tabs)
@@ -1243,7 +1272,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 }
                 // Open sidekick config
                 (true, false, false, gdk::Key::comma) => {
-                    open_config_in_nvim(&nb, &cfg.borrow(), &agent_map_kb);
+                    open_config_in_nvim(&nb, &cfg.borrow(), &agent_map_kb, &tab_names_kb);
                     glib::Propagation::Stop
                 }
                 (true, true, false, gdk::Key::r | gdk::Key::R) => {
@@ -1323,6 +1352,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         let nb_editor = notebook.clone();
         let cfg_editor = Rc::clone(&cfg);
         let agent_map_editor = Rc::clone(&agent_map);
+        let tab_names_editor = Rc::clone(&tab_names);
         let on_saved_ref = Rc::clone(&on_editor_saved);
         #[allow(deprecated)]
         tree_view.connect_row_activated(move |_tv, path, _col| {
@@ -1334,6 +1364,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                         &nb_editor,
                         &cfg_editor.borrow(),
                         &agent_map_editor,
+                        &tab_names_editor,
                         on_saved_ref.borrow().as_ref().map(Rc::clone),
                     );
                 }
@@ -1557,6 +1588,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         let cfg = Rc::clone(&cfg);
         let win_ipc = window.clone();
         let agent_map_ipc = Rc::clone(&agent_map);
+        let tab_names_ipc = Rc::clone(&tab_names);
         glib::MainContext::default().spawn_local(async move {
             while let Ok(req) = ipc_rx.recv().await {
                 let ipc::Request { command, reply } = req;
@@ -1567,7 +1599,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                         accepted: None,
                     },
                     ipc::Command::NewTab => {
-                        add_tab(&nb, &cfg.borrow(), None, &agent_map_ipc);
+                        add_tab(&nb, &cfg.borrow(), None, &agent_map_ipc, &tab_names_ipc);
                         ipc::Response {
                             ok: true,
                             error: None,
@@ -1670,6 +1702,7 @@ struct PaletteContext<'a> {
     search_entry: &'a gtk4::Entry,
     toggle_sidebar: &'a Rc<dyn Fn()>,
     toggle_browser: &'a Rc<dyn Fn()>,
+    tab_names: &'a Rc<RefCell<HashMap<u64, String>>>,
 }
 
 fn build_palette_actions(ctx: PaletteContext<'_>) -> Rc<Vec<palette::Action>> {
@@ -1688,12 +1721,13 @@ fn build_palette_actions(ctx: PaletteContext<'_>) -> Rc<Vec<palette::Action>> {
         let nb = ctx.notebook.clone();
         let cfg = Rc::clone(ctx.cfg);
         let agent_map = Rc::clone(ctx.agent_map);
+        let tab_names = Rc::clone(ctx.tab_names);
         push(
             "New Tab",
             Some("Ctrl+Shift+T"),
             Rc::new(move || {
                 let cwd = focused_terminal_cwd(&win, &nb);
-                add_tab(&nb, &cfg.borrow(), cwd.as_deref(), &agent_map);
+                add_tab(&nb, &cfg.borrow(), cwd.as_deref(), &agent_map, &tab_names);
             }),
         );
     }
@@ -1830,11 +1864,12 @@ fn build_palette_actions(ctx: PaletteContext<'_>) -> Rc<Vec<palette::Action>> {
         let nb = ctx.notebook.clone();
         let cfg = Rc::clone(ctx.cfg);
         let agent_map = Rc::clone(ctx.agent_map);
+        let tab_names = Rc::clone(ctx.tab_names);
         push(
             "Open Config File",
             Some("Ctrl+,"),
             Rc::new(move || {
-                open_config_in_nvim(&nb, &cfg.borrow(), &agent_map);
+                open_config_in_nvim(&nb, &cfg.borrow(), &agent_map, &tab_names);
             }),
         );
     }
@@ -1982,8 +2017,14 @@ fn show_filetree_error(parent: &gtk4::Widget, message: &str, detail: &str) {
         .show(window.as_ref());
 }
 
-fn add_tab(notebook: &Notebook, cfg: &config::Config, cwd: Option<&str>, agent_map: &AgentMap) {
-    add_tab_with_command(notebook, cfg, cwd, agent_map, None);
+fn add_tab(
+    notebook: &Notebook,
+    cfg: &config::Config,
+    cwd: Option<&str>,
+    agent_map: &AgentMap,
+    tab_names: &Rc<RefCell<HashMap<u64, String>>>,
+) {
+    add_tab_with_command(notebook, cfg, cwd, agent_map, tab_names, None);
 }
 
 /// Spawn the user's shell in `terminal`, exporting SIDEKICK_TAB_ID so hooks
@@ -2036,6 +2077,7 @@ fn add_tab_with_command(
     cfg: &config::Config,
     cwd: Option<&str>,
     agent_map: &AgentMap,
+    tab_names: &Rc<RefCell<HashMap<u64, String>>>,
     startup_command: Option<String>,
 ) {
     let terminal = tab::build(cfg);
@@ -2056,14 +2098,23 @@ fn add_tab_with_command(
 
     // Right-click the tab label to rename it; a custom name overrides the
     // automatic cwd-based title until reset.
-    let custom_title: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let custom_title: Rc<RefCell<Option<String>>> =
+        Rc::new(RefCell::new(tab_names.borrow().get(&tab_id).cloned()));
     {
         let custom = Rc::clone(&custom_title);
         let label_w: gtk4::Widget = tab_label.clone().upcast();
+        let names = Rc::clone(tab_names);
         let gesture = gtk4::GestureClick::new();
         gesture.set_button(3);
         gesture.connect_pressed(move |gesture, _n, x, y| {
-            show_tab_context_menu(&label_w, x, y, Rc::clone(&custom));
+            show_tab_context_menu(
+                &label_w,
+                x,
+                y,
+                Rc::clone(&custom),
+                Rc::clone(&names),
+                tab_id,
+            );
             gesture.set_state(gtk4::EventSequenceState::Claimed);
         });
         tab_label.add_controller(gesture);
@@ -2141,6 +2192,7 @@ fn add_tab_with_command(
         let agent_map_ref = Rc::clone(agent_map);
         let prev_state_ref: Rc<Cell<AgentState>> = Rc::new(Cell::new(AgentState::Idle));
         let custom_title_ref = Rc::clone(&custom_title);
+        let tab_names_tick = Rc::clone(tab_names);
         glib::timeout_add_local(Duration::from_millis(500), move || {
             let pid = pid_ref.get();
             if pid < 0 {
@@ -2186,7 +2238,11 @@ fn add_tab_with_command(
             }
 
             let (auto_title, detail_text) = tab::tab_title_parts(pid);
-            let title_text = custom_title_ref.borrow().clone().unwrap_or(auto_title);
+            let title_text = custom_title_ref
+                .borrow()
+                .clone()
+                .or_else(|| tab_names_tick.borrow().get(&tab_id).cloned())
+                .unwrap_or(auto_title);
             let escaped_title = glib::markup_escape_text(&title_text);
             let state = agent_ref.get();
 
@@ -2299,9 +2355,14 @@ fn add_tab_with_command(
     });
 }
 
-fn open_config_in_nvim(notebook: &Notebook, cfg: &config::Config, agent_map: &AgentMap) {
+fn open_config_in_nvim(
+    notebook: &Notebook,
+    cfg: &config::Config,
+    agent_map: &AgentMap,
+    tab_names: &Rc<RefCell<HashMap<u64, String>>>,
+) {
     let path = config::config_path();
-    open_path_in_nvim(notebook, cfg, agent_map, &path);
+    open_path_in_nvim(notebook, cfg, agent_map, tab_names, &path);
 }
 
 fn open_file_from_file_manager(
@@ -2309,11 +2370,18 @@ fn open_file_from_file_manager(
     notebook: &Notebook,
     cfg: &config::Config,
     agent_map: &AgentMap,
+    tab_names: &Rc<RefCell<HashMap<u64, String>>>,
     on_saved: Option<SaveCallback>,
 ) {
     match cfg.editor.file_manager_open.as_str() {
         "nvim" | "vim" | "neovim" => {
-            open_path_in_nvim(notebook, cfg, agent_map, std::path::Path::new(path));
+            open_path_in_nvim(
+                notebook,
+                cfg,
+                agent_map,
+                tab_names,
+                std::path::Path::new(path),
+            );
         }
         _ => {
             editor::open_with_save_callback(path, notebook, cfg, on_saved);
@@ -2325,11 +2393,12 @@ fn open_path_in_nvim(
     notebook: &Notebook,
     cfg: &config::Config,
     agent_map: &AgentMap,
+    tab_names: &Rc<RefCell<HashMap<u64, String>>>,
     path: &std::path::Path,
 ) {
     let cwd = path.parent().and_then(|p| p.to_str());
     let command = format!("nvim {}", shell_quote_path(path));
-    add_tab_with_command(notebook, cfg, cwd, agent_map, Some(command));
+    add_tab_with_command(notebook, cfg, cwd, agent_map, tab_names, Some(command));
 }
 
 fn focused_terminal(window: &ApplicationWindow, notebook: &Notebook) -> Option<vte4::Terminal> {
@@ -2498,12 +2567,25 @@ fn notebook_page_of(widget: &gtk4::Widget, notebook: &Notebook) -> Option<gtk4::
 
 /// Capture the current tabs (terminal layout + cwds) for session restore.
 /// Editor/diff tabs are not captured.
-fn snapshot_session(notebook: &Notebook) -> session::Session {
+fn snapshot_session(
+    notebook: &Notebook,
+    agent_map: &AgentMap,
+    tab_names: &Rc<RefCell<HashMap<u64, String>>>,
+) -> session::Session {
     let mut tabs = Vec::new();
     for i in 0..notebook.n_pages() {
         if let Some(page) = notebook.nth_page(Some(i)) {
-            if let Some(node) = capture_layout(&page) {
-                tabs.push(node);
+            if let Some(root) = capture_layout(&page) {
+                // The tab's name is keyed by the tab id of its first terminal.
+                let name = pane::collect_terminals_pub(&page)
+                    .into_iter()
+                    .next()
+                    .and_then(|term| {
+                        let key = term.as_ptr() as usize;
+                        agent_map.borrow().get(&key).map(|(id, _)| *id)
+                    })
+                    .and_then(|id| tab_names.borrow().get(&id).cloned());
+                tabs.push(session::TabLayout { name, root });
             }
         }
     }
@@ -2520,6 +2602,15 @@ fn capture_layout(widget: &gtk4::Widget) -> Option<session::Node> {
     if let Ok(paned) = widget.clone().downcast::<gtk4::Paned>() {
         let first = paned.start_child().and_then(|w| capture_layout(&w));
         let second = paned.end_child().and_then(|w| capture_layout(&w));
+        let size = match paned.orientation() {
+            gtk4::Orientation::Vertical => paned.height(),
+            _ => paned.width(),
+        };
+        let ratio = if size > 0 {
+            Some(paned.position() as f64 / size as f64)
+        } else {
+            None
+        };
         return match (first, second) {
             (Some(a), Some(b)) => Some(session::Node::Split {
                 orientation: if paned.orientation() == gtk4::Orientation::Vertical {
@@ -2527,6 +2618,7 @@ fn capture_layout(widget: &gtk4::Widget) -> Option<session::Node> {
                 } else {
                     "h".to_string()
                 },
+                ratio,
                 first: Box::new(a),
                 second: Box::new(b),
             }),
@@ -2539,15 +2631,26 @@ fn capture_layout(widget: &gtk4::Widget) -> Option<session::Node> {
 
 /// Recreate tabs from the saved session. Returns false when there was
 /// nothing usable to restore.
-fn restore_session(notebook: &Notebook, cfg: &config::Config, agent_map: &AgentMap) -> bool {
+fn restore_session(
+    notebook: &Notebook,
+    cfg: &config::Config,
+    agent_map: &AgentMap,
+    tab_names: &Rc<RefCell<HashMap<u64, String>>>,
+) -> bool {
     let Some(saved) = session::load() else {
         return false;
     };
     if saved.tabs.is_empty() {
         return false;
     }
-    for node in &saved.tabs {
-        add_tab(notebook, cfg, Some(node.first_cwd()), agent_map);
+    for tab in &saved.tabs {
+        add_tab(
+            notebook,
+            cfg,
+            Some(tab.root.first_cwd()),
+            agent_map,
+            tab_names,
+        );
         // The tab's root terminal is the page we just appended.
         let Some(term) = notebook
             .nth_page(Some(notebook.n_pages() - 1))
@@ -2555,7 +2658,15 @@ fn restore_session(notebook: &Notebook, cfg: &config::Config, agent_map: &AgentM
         else {
             continue;
         };
-        expand_layout(notebook, cfg, agent_map, &term, node);
+        // Record the custom name against this tab's id so it shows (next tick)
+        // and persists on the next snapshot.
+        if let Some(name) = &tab.name {
+            let key = term.as_ptr() as usize;
+            if let Some((id, _)) = agent_map.borrow().get(&key) {
+                tab_names.borrow_mut().insert(*id, name.clone());
+            }
+        }
+        expand_layout(notebook, cfg, agent_map, &term, &tab.root);
     }
     notebook.set_current_page(Some(0));
     true
@@ -2572,6 +2683,7 @@ fn expand_layout(
 ) {
     let session::Node::Split {
         orientation,
+        ratio,
         first,
         second,
     } = node
@@ -2593,6 +2705,26 @@ fn expand_layout(
         None,
         None,
     );
+    // Apply the saved divider ratio once layout has settled.
+    if let Some(r) = ratio {
+        if let Some(paned) = new_term
+            .parent()
+            .and_then(|p| p.downcast::<gtk4::Paned>().ok())
+        {
+            let r = *r;
+            let paned_c = paned.clone();
+            glib::idle_add_local(move || {
+                let size = match paned_c.orientation() {
+                    gtk4::Orientation::Vertical => paned_c.height(),
+                    _ => paned_c.width(),
+                };
+                if size > 0 {
+                    paned_c.set_position((r * size as f64).round() as i32);
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    }
     expand_layout(notebook, cfg, agent_map, term, first);
     expand_layout(notebook, cfg, agent_map, &new_term, second);
 }
@@ -2602,6 +2734,8 @@ fn show_tab_context_menu(
     x: f64,
     y: f64,
     custom_title: Rc<RefCell<Option<String>>>,
+    tab_names: Rc<RefCell<HashMap<u64, String>>>,
+    tab_id: u64,
 ) {
     let popover = gtk4::Popover::new();
     popover.set_has_arrow(false);
@@ -2613,13 +2747,16 @@ fn show_tab_context_menu(
     add_filetree_menu_item(&vbox, "Rename tab…", &popover, {
         let parent_w = parent.clone();
         let custom = Rc::clone(&custom_title);
-        move || prompt_tab_rename(&parent_w, Rc::clone(&custom))
+        let names = Rc::clone(&tab_names);
+        move || prompt_tab_rename(&parent_w, Rc::clone(&custom), Rc::clone(&names), tab_id)
     });
     if custom_title.borrow().is_some() {
         add_filetree_menu_item(&vbox, "Reset name", &popover, {
             let custom = Rc::clone(&custom_title);
+            let names = Rc::clone(&tab_names);
             move || {
                 *custom.borrow_mut() = None;
+                names.borrow_mut().remove(&tab_id);
             }
         });
     }
@@ -2630,7 +2767,12 @@ fn show_tab_context_menu(
     popover.popup();
 }
 
-fn prompt_tab_rename(parent: &gtk4::Widget, custom_title: Rc<RefCell<Option<String>>>) {
+fn prompt_tab_rename(
+    parent: &gtk4::Widget,
+    custom_title: Rc<RefCell<Option<String>>>,
+    tab_names: Rc<RefCell<HashMap<u64, String>>>,
+    tab_id: u64,
+) {
     let parent_window = parent
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
@@ -2659,7 +2801,13 @@ fn prompt_tab_rename(parent: &gtk4::Widget, custom_title: Rc<RefCell<Option<Stri
         let win_c = win.clone();
         entry.connect_activate(move |e| {
             let text = e.text().trim().to_string();
-            *custom_title.borrow_mut() = if text.is_empty() { None } else { Some(text) };
+            if text.is_empty() {
+                *custom_title.borrow_mut() = None;
+                tab_names.borrow_mut().remove(&tab_id);
+            } else {
+                *custom_title.borrow_mut() = Some(text.clone());
+                tab_names.borrow_mut().insert(tab_id, text);
+            }
             win_c.close();
         });
     }
