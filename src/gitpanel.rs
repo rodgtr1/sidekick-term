@@ -310,9 +310,36 @@ fn show_context_menu(
             let root = root.to_string();
             let refresh = Rc::clone(on_refresh);
             let parent_w = parent.clone();
-            move || match git::discard(&root, &path, is_untracked) {
-                Ok(()) => refresh(),
-                Err(e) => show_git_error(&parent_w, &e),
+            move || {
+                let window = parent_w
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                let detail = if is_untracked {
+                    format!("{path}\n\nThis untracked file will be deleted. This cannot be undone.")
+                } else {
+                    format!(
+                        "{path}\n\nLocal changes to this file will be lost. This cannot be undone."
+                    )
+                };
+                let path = path.clone();
+                let root = root.clone();
+                let refresh = Rc::clone(&refresh);
+                let parent_w = parent_w.clone();
+                gtk4::AlertDialog::builder()
+                    .message("Discard changes?")
+                    .detail(detail)
+                    .buttons(["Cancel", "Discard"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .build()
+                    .choose(window.as_ref(), None::<&gio::Cancellable>, move |choice| {
+                        if choice == Ok(1) {
+                            match git::discard(&root, &path, is_untracked) {
+                                Ok(()) => refresh(),
+                                Err(e) => show_git_error(&parent_w, &e),
+                            }
+                        }
+                    });
             }
         });
     }
