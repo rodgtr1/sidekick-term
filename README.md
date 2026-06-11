@@ -146,6 +146,7 @@ terminal tab, based on the `[editor]` configuration.
 | `Ctrl+Shift+W` | Close the current pane, editor tab, or diff tab; the final tab stays open |
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+Shift+Tab` | Previous tab |
+| `Ctrl+1` … `Ctrl+9` | Jump to tab 1–9 |
 | `Ctrl+Shift+D` | Split terminal right |
 | `Ctrl+Shift+X` | Split terminal down |
 | `Alt+Left` | Focus previous terminal pane |
@@ -237,9 +238,30 @@ open_browser = "http://localhost:3000"
 The browser panel has the WebKit inspector enabled — right-click →
 "Inspect Element" while previewing whatever your agents are building.
 
+While a `▶` task is running in its split, its run-panel status shows a yellow
+dot; click the dot to stop the task (sends `SIGTERM` to its process group).
+
+A task may also carry an `llm` prompt. When set, the task row shows a `✦`
+button that copies that prompt to the clipboard — handy for pasting context
+into an agent:
+
+```toml
+[[tasks]]
+name = "explain failure"
+cmd  = "cargo test"
+llm  = "Explain the test failure above and propose a fix."
+```
+
+**Trust note:** project tasks come from a `.sidekick.toml` committed to the
+repository you are in. Treat them like any other code in that repo — running a
+task (`▶`) executes its command, and `open_browser` loads its URL in the
+embedded browser. Only run project tasks from repositories you trust, the same
+way you would with VS Code workspace tasks.
+
 When an agent flips to **waiting** or **finished** while the sidekick window
-is unfocused, a desktop notification is sent, and the activity bar shows a
-badge with the number of agents currently waiting for input.
+is unfocused, a desktop notification is sent (clicking it focuses that tab),
+and the activity bar shows a badge with the number of agents currently waiting
+for input.
 
 ## Shell Integration
 
@@ -290,8 +312,10 @@ re-copy `shell-integration.zsh` to pick it up.
 `sidekick` listens on:
 
 ```text
-~/.local/run/sidekick.sock
+$XDG_RUNTIME_DIR/sidekick/sidekick.sock
 ```
+
+(falling back to `~/.local/run/sidekick.sock` when `XDG_RUNTIME_DIR` is unset).
 
 You can check that a running instance is reachable:
 
