@@ -1,6 +1,16 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+fn socket_path() -> std::path::PathBuf {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime.is_empty() {
+            return std::path::PathBuf::from(runtime).join("sidekick/sidekick.sock");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home).join(".local/run/sidekick.sock")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Agent commands carry the tab id (injected into each shell's environment
@@ -29,8 +39,8 @@ fn main() {
         }
     };
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let socket = format!("{home}/.local/run/sidekick.sock");
+    let socket = socket_path();
+    let socket = socket.to_string_lossy().to_string();
 
     let mut stream = UnixStream::connect(&socket).unwrap_or_else(|e| {
         eprintln!("sidekick-ctl: could not connect to {socket}: {e}");

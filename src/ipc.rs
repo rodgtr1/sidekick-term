@@ -52,6 +52,13 @@ pub struct Request {
 }
 
 pub fn socket_path() -> std::path::PathBuf {
+    // Prefer the per-user runtime dir (0700, tmpfs). Fall back to the historic
+    // ~/.local/run location when XDG_RUNTIME_DIR is unset.
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime.is_empty() {
+            return std::path::PathBuf::from(runtime).join("sidekick/sidekick.sock");
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     std::path::PathBuf::from(home).join(".local/run/sidekick.sock")
 }
