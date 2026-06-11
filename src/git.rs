@@ -81,15 +81,11 @@ pub fn repo_root(cwd: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-pub fn changed_files(cwd: &str) -> Vec<GitFile> {
-    let root = match repo_root(cwd) {
-        Some(r) => r,
-        None => return vec![],
-    };
+pub fn changed_files(root: &str) -> Vec<GitFile> {
     // -z gives NUL-delimited, unquoted paths (porcelain v1 C-quotes paths with
     // special characters otherwise, which would break abs_path).
     let out = match crate::limits::command_stdout_limited(
-        Command::new("git").args(["-C", &root, "status", "--porcelain=v1", "-z", "-u"]),
+        Command::new("git").args(["-C", root, "status", "--porcelain=v1", "-z", "-u"]),
         MAX_GIT_STATUS_BYTES,
         &[],
         crate::limits::CapMode::Fail,
@@ -226,13 +222,9 @@ pub fn current_branch(root: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn ahead_count(cwd: &str) -> u32 {
-    let root = match repo_root(cwd) {
-        Some(r) => r,
-        None => return 0,
-    };
+pub fn ahead_count(root: &str) -> u32 {
     let out = Command::new("git")
-        .args(["-C", &root, "rev-list", "--count", "@{u}..HEAD"])
+        .args(["-C", root, "rev-list", "--count", "@{u}..HEAD"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
@@ -298,6 +290,8 @@ pub fn pull(cwd: &str) -> Result<(), String> {
     let root = repo_root(cwd).ok_or_else(|| "Not a git repository.".to_string())?;
     let out = Command::new("git")
         .args(["-C", &root, "pull"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| e.to_string())?;
@@ -312,6 +306,8 @@ pub fn push(cwd: &str) -> Result<(), String> {
     let root = repo_root(cwd).ok_or_else(|| "Not a git repository.".to_string())?;
     let out = Command::new("git")
         .args(["-C", &root, "push"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| e.to_string())?;
