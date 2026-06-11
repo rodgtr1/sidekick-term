@@ -9,6 +9,7 @@ pub const COL_PATH: u32 = 1;
 pub const COL_IS_DIR: u32 = 2;
 pub const COL_IGNORED: u32 = 3;
 const MAX_DEPTH: u32 = 2;
+const MAX_TREE_TOTAL_ENTRIES: usize = 5000;
 pub const PLACEHOLDER_PATH: &str = "//placeholder//";
 pub const LOADING_PATH: &str = "//loading//";
 
@@ -144,13 +145,15 @@ pub fn build() -> (
 
 pub fn scan_root(root: &str) -> Vec<TreeEntry> {
     let ignored = crate::git::ignored_set(root);
-    scan_dir(root, 0, &ignored)
+    let mut budget = MAX_TREE_TOTAL_ENTRIES;
+    scan_dir_budgeted(root, 0, &ignored, &mut budget)
 }
 
 pub fn scan_subtree(path: &str) -> Vec<TreeEntry> {
     let root = crate::git::repo_root(path).unwrap_or_else(|| path.to_string());
     let ignored = crate::git::ignored_set(&root);
-    scan_dir(path, 0, &ignored)
+    let mut budget = MAX_TREE_TOTAL_ENTRIES;
+    scan_dir_budgeted(path, 0, &ignored, &mut budget)
 }
 
 /// Bulk-load entries into the store. Detaches the view during population so
@@ -251,12 +254,21 @@ fn clear_children(store: &gtk4::TreeStore, parent: &gtk4::TreeIter) {
     }
 }
 
-fn scan_dir(path: &str, depth: u32, ignored: &std::collections::HashSet<String>) -> Vec<TreeEntry> {
+fn scan_dir_budgeted(
+    path: &str,
+    depth: u32,
+    ignored: &std::collections::HashSet<String>,
+    budget: &mut usize,
+) -> Vec<TreeEntry> {
+    if *budget == 0 {
+        return Vec::new();
+    }
+    let take = (*budget).min(crate::limits::MAX_DIRECTORY_ENTRIES);
     let mut entries: Vec<TreeEntry> = std::fs::read_dir(path)
         .into_iter()
         .flatten()
         .flatten()
-        .take(crate::limits::MAX_DIRECTORY_ENTRIES)
+        .take(take)
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             if name == ".git" {
@@ -275,14 +287,18 @@ fn scan_dir(path: &str, depth: u32, ignored: &std::collections::HashSet<String>)
         })
         .collect();
 
+    *budget = budget.saturating_sub(entries.len());
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
 
     for entry in &mut entries {
         if !entry.is_dir || entry.ignored {
             continue;
         }
+        if *budget == 0 {
+            break;
+        }
         if depth < MAX_DEPTH {
-            entry.children = scan_dir(&entry.path, depth + 1, ignored);
+            entry.children = scan_dir_budgeted(&entry.path, depth + 1, ignored, budget);
         } else {
             // At max depth: peek to see if this dir has any content so we can
             // show an expand arrow. One read_dir call, no recursion.
@@ -313,5 +329,25 @@ fn apply_entries(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, entri
         store.set_value(&iter, COL_IS_DIR, &entry.is_dir.to_value());
         store.set_value(&iter, COL_IGNORED, &entry.ignored.to_value());
         apply_entries(store, Some(&iter), &entry.children);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_dir_budgeted;
+    use std::collections::HashSet;
+
+    #[test]
+    fn scan_respects_total_budget() {
+        let dir = std::env::temp_dir().join(format!("sidekick-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let ignored: HashSet<String> = HashSet::new();
+        let mut budget = 3usize;
+        let entries = scan_dir_budgeted(dir.to_str().unwrap(), 0, &ignored, &mut budget);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(entries.len() <= 3, "got {} entries", entries.len());
     }
 }
