@@ -43,8 +43,17 @@ fn main() {
     let socket = socket.to_string_lossy().to_string();
 
     let mut stream = UnixStream::connect(&socket).unwrap_or_else(|e| {
-        eprintln!("sidekick-ctl: could not connect to {socket}: {e}");
-        eprintln!("Is sidekick running?");
+        use std::io::ErrorKind;
+        match e.kind() {
+            // No socket file, or a stale socket with no listener (e.g. a
+            // previous instance was killed) — sidekick simply isn't running.
+            ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
+                eprintln!("sidekick-ctl: sidekick is not running.");
+            }
+            _ => {
+                eprintln!("sidekick-ctl: could not connect to {socket}: {e}");
+            }
+        }
         std::process::exit(1);
     });
 
