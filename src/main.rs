@@ -147,7 +147,19 @@ fn main() -> glib::ExitCode {
     }
 
     let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| build_ui(app, initial_dir.as_deref()));
+    let built = std::rc::Rc::new(std::cell::Cell::new(false));
+    app.connect_activate(move |app| {
+        if built.get() {
+            // Already running: a second launch just refocuses the window.
+            // (--dir on a second launch is not forwarded to the primary.)
+            if let Some(win) = app.active_window() {
+                win.present();
+            }
+            return;
+        }
+        built.set(true);
+        build_ui(app, initial_dir.as_deref());
+    });
     app.run_with_args(&gtk_args)
 }
 
@@ -357,6 +369,41 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         .child(&root_box)
         .build();
 
+    // App action so agent/command notifications can focus their tab on click.
+    {
+        use gio::prelude::ActionMapExt;
+        let nb = notebook.clone();
+        let win = window.clone();
+        let agent_map_act = Rc::clone(&agent_map);
+        let action = gio::SimpleAction::new("focus-tab", Some(glib::VariantTy::UINT64));
+        action.connect_activate(move |_, param| {
+            let Some(target) = param.and_then(|p| p.get::<u64>()) else {
+                return;
+            };
+            for i in 0..nb.n_pages() {
+                let Some(page) = nb.nth_page(Some(i)) else {
+                    continue;
+                };
+                let Some(term) = pane::collect_terminals_pub(&page).into_iter().next() else {
+                    continue;
+                };
+                let key = term.as_ptr() as usize;
+                let matches = agent_map_act
+                    .borrow()
+                    .get(&key)
+                    .map(|(id, _)| *id == target)
+                    .unwrap_or(false);
+                if matches {
+                    nb.set_current_page(Some(i));
+                    win.present();
+                    term.grab_focus();
+                    break;
+                }
+            }
+        });
+        app.add_action(&action);
+    }
+
     // Persist the session on close and periodically (crash safety).
     {
         let nb = notebook.clone();
@@ -423,7 +470,18 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 move |task, action, status| match action {
                     runpanel::TaskAction::Paste => {
                         if let Some(term) = focused_terminal(&win_r, &nb_r) {
-                            term.feed_child(task.cmd.as_bytes());
+                            if task.cmd.contains('\n') {
+                                // Multi-line: wrap in bracketed-paste so the
+                                // shell treats embedded newlines as pasted text
+                                // instead of executing each line immediately.
+                                let mut bytes = Vec::with_capacity(task.cmd.len() + 12);
+                                bytes.extend_from_slice(b"\x1b[200~");
+                                bytes.extend_from_slice(task.cmd.as_bytes());
+                                bytes.extend_from_slice(b"\x1b[201~");
+                                term.feed_child(&bytes);
+                            } else {
+                                term.feed_child(task.cmd.as_bytes());
+                            }
                             term.grab_focus();
                         }
                     }
@@ -465,8 +523,8 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
-                let files = git::changed_files(&cwd);
-                let ahead = git::ahead_count(&cwd);
+                let files = git::changed_files(&root);
+                let ahead = git::ahead_count(&root);
                 let branch = git::current_branch(&root);
                 let _ = tx.send_blocking(UiResult::Git {
                     cwd,
@@ -643,7 +701,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         glib::timeout_add_seconds_local(1, move || {
             if let Some(cwd) = focused_terminal_cwd(&win, &nb) {
                 let mut prev = last.borrow_mut();
-                if *prev != cwd {
+                if *prev != cwd && !tree_busy_c.get() {
                     *prev = cwd.clone();
                     tree_busy_c.set(true);
                     let tx = tx.clone();
@@ -766,7 +824,13 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         let last_cwd = Rc::clone(&last_cwd);
         let populate_tasks = Rc::clone(&populate_tasks);
         move || {
-            let next = config::Config::load();
+            let next = match config::Config::load_checked() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("sidekick: config reload failed, keeping previous config: {e}");
+                    return;
+                }
+            };
             *cfg.borrow_mut() = next;
 
             {
@@ -965,6 +1029,18 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 });
             }
             since.borrow_mut().retain(|id, _| live_tabs.contains(id));
+            // Waiting-for-input tabs first (longest wait first), then the rest
+            // in tab order (stable sort preserves tab order within a group).
+            rows.sort_by(|a, b| {
+                let a_wait = a.state_label == "WAIT";
+                let b_wait = b.state_label == "WAIT";
+                match (a_wait, b_wait) {
+                    (true, true) => b.elapsed_secs.cmp(&a.elapsed_secs),
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => std::cmp::Ordering::Equal,
+                }
+            });
             if vis.get() && stack.visible_child_name().as_deref() == Some("agents") {
                 panel.populate(&rows);
             }
@@ -1147,19 +1223,21 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                     });
                     glib::Propagation::Stop
                 }
-                // Quick open: file name search
+                // Quick open: file name search. If we cannot open (no cwd, or
+                // bare home dir with no repo), let Ctrl+F reach the shell.
                 (true, false, false, gdk::Key::f | gdk::Key::F) => {
                     let cwd = last_cwd_qo.borrow().clone();
-                    if !cwd.is_empty() {
-                        let repo = git::repo_root(&cwd);
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        // Outside a repo, refuse to index the entire home dir.
-                        if repo.is_some() || cwd != home {
-                            let root = repo.unwrap_or(cwd);
-                            if let Some(on_saved) = on_saved_k.borrow().as_ref() {
-                                quickopen::show(&root, &win, &nb, &cfg_qo, Rc::clone(on_saved));
-                            }
-                        }
+                    if cwd.is_empty() {
+                        return glib::Propagation::Proceed;
+                    }
+                    let repo = git::repo_root(&cwd);
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    if repo.is_none() && cwd == home {
+                        return glib::Propagation::Proceed;
+                    }
+                    let root = repo.unwrap_or(cwd);
+                    if let Some(on_saved) = on_saved_k.borrow().as_ref() {
+                        quickopen::show(&root, &win, &nb, &cfg_qo, Rc::clone(on_saved));
                     }
                     glib::Propagation::Stop
                 }
@@ -1221,6 +1299,15 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 // Toggle browser panel
                 (true, true, false, gdk::Key::o | gdk::Key::O) => {
                     toggle_browser_k();
+                    glib::Propagation::Stop
+                }
+                // Jump to tab N (Ctrl+1 .. Ctrl+9)
+                (true, false, false, k) if tab_jump_index(k).is_some() => {
+                    if let Some(i) = tab_jump_index(k) {
+                        if i < nb.n_pages() {
+                            nb.set_current_page(Some(i));
+                        }
+                    }
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -2006,6 +2093,7 @@ fn add_tab_with_command(
     wire_agent_state_handlers(
         &terminal,
         &agent_state,
+        tab_id,
         Some((Rc::clone(&dirty), notebook.clone())),
     );
     {
@@ -2111,7 +2199,19 @@ fn add_tab_with_command(
                 let needs_attention = matches!(state, AgentState::Ready)
                     || (matches!(state, AgentState::Done) && matches!(prev, AgentState::Busy));
                 if needs_attention {
-                    notify_agent_attention(&nb_ref, agent_key, state, &title_text, &detail_text);
+                    let tab_id = agent_map_ref
+                        .borrow()
+                        .get(&agent_key)
+                        .map(|(id, _)| *id)
+                        .unwrap_or(0);
+                    notify_agent_attention(
+                        &nb_ref,
+                        agent_key,
+                        tab_id,
+                        state,
+                        &title_text,
+                        &detail_text,
+                    );
                 }
             }
             let status_label = if matches!(state, AgentState::Idle) && dirty_ref.get() {
@@ -2191,6 +2291,8 @@ fn add_tab_with_command(
         agent_map_close.borrow_mut().remove(&agent_key);
         if let Some(t) = weak.upgrade() {
             if pane::close_terminal(&t, &nb) {
+                // All shells exited deliberately — start fresh next launch.
+                session::save(&session::Session::default());
                 std::process::exit(0);
             }
         }
@@ -2583,6 +2685,7 @@ fn prompt_tab_rename(parent: &gtk4::Widget, custom_title: Rc<RefCell<Option<Stri
 fn notify_agent_attention(
     notebook: &Notebook,
     key: usize,
+    tab_id: u64,
     state: AgentState,
     title: &str,
     detail: &str,
@@ -2606,6 +2709,7 @@ fn notify_agent_attention(
     };
     let notification = gio::Notification::new(summary);
     notification.set_body(Some(&format!("{title} — {detail}")));
+    notification.set_default_action_and_target_value("app.focus-tab", Some(&tab_id.to_variant()));
     // One notification id per terminal so updates replace instead of stack.
     app.send_notification(Some(&format!("sidekick-agent-{key}")), &notification);
 }
@@ -2613,7 +2717,7 @@ fn notify_agent_attention(
 /// Desktop notification when a long-running command finishes while the
 /// window is unfocused. Exit code comes from the shell-integration termprop;
 /// without it the notification still fires, just without a failure marker.
-fn notify_long_command_finished(terminal: &vte4::Terminal, duration: Duration) {
+fn notify_long_command_finished(terminal: &vte4::Terminal, tab_id: u64, duration: Duration) {
     let Some(window) = terminal
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok())
@@ -2647,6 +2751,7 @@ fn notify_long_command_finished(terminal: &vte4::Terminal, duration: Duration) {
         "{} — {place}",
         agentpanel::format_elapsed(duration.as_secs())
     )));
+    notification.set_default_action_and_target_value("app.focus-tab", Some(&tab_id.to_variant()));
     // One notification id per terminal so updates replace instead of stack.
     let key = terminal.as_ptr() as usize;
     app.send_notification(Some(&format!("sidekick-cmd-{key}")), &notification);
@@ -2684,6 +2789,7 @@ fn set_agent_state(
 fn wire_agent_state_handlers(
     terminal: &vte4::Terminal,
     agent_state: &AgentCell,
+    tab_id: u64,
     dirty_ctx: Option<(Rc<Cell<bool>>, Notebook)>,
 ) {
     // When the last command started, for long-command notifications.
@@ -2702,7 +2808,7 @@ fn wire_agent_state_handlers(
             if let Some(started) = started_c.take() {
                 let duration = started.elapsed();
                 if !was_explicit_busy && duration.as_secs() >= LONG_COMMAND_NOTIFY_SECS {
-                    notify_long_command_finished(&term_c, duration);
+                    notify_long_command_finished(&term_c, tab_id, duration);
                 }
             }
             if let Some((dirty, nb)) = &dirty_ctx {
@@ -2801,7 +2907,7 @@ fn split_terminal(
     agent_map
         .borrow_mut()
         .insert(new_key, (tab_id, Rc::clone(&agent_state)));
-    wire_agent_state_handlers(&new_term, &agent_state, None);
+    wire_agent_state_handlers(&new_term, &agent_state, tab_id, None);
 
     spawn_shell(&new_term, cwd, tab_id, startup_command, pid_cell);
 
@@ -2829,7 +2935,22 @@ fn split_terminal(
 /// label from "running" to "done" when the command finishes.
 fn track_task_status(terminal: &vte4::Terminal, pid_cell: Rc<Cell<i32>>, label: &gtk4::Label) {
     label.set_markup("<span foreground=\"#f9e2af\">●</span>");
-    label.set_tooltip_text(Some("running"));
+    label.set_tooltip_text(Some("running — click to stop"));
+
+    // Click the running indicator to SIGTERM the task's foreground group.
+    let stop_gesture = gtk4::GestureClick::new();
+    {
+        let term_for_stop = terminal.clone();
+        stop_gesture.connect_pressed(move |_, _, _, _| {
+            if let Some(pgid) = terminal_foreground_pgid(&term_for_stop) {
+                unsafe {
+                    libc::killpg(pgid, libc::SIGTERM);
+                }
+            }
+        });
+    }
+    label.add_controller(stop_gesture);
+
     let term_weak = terminal.downgrade();
     let label_weak = label.downgrade();
     let started = Cell::new(false);
@@ -2917,6 +3038,22 @@ fn foreground_process_command(pid: i32) -> Option<String> {
 fn is_known_agent_command(command: &str) -> bool {
     let command = command.to_ascii_lowercase();
     command.contains("claude") || command.contains("codex")
+}
+
+/// Map Ctrl+1..Ctrl+9 to a zero-based tab index (1 -> 0, ... 9 -> 8).
+fn tab_jump_index(key: gdk::Key) -> Option<u32> {
+    match key {
+        gdk::Key::_1 => Some(0),
+        gdk::Key::_2 => Some(1),
+        gdk::Key::_3 => Some(2),
+        gdk::Key::_4 => Some(3),
+        gdk::Key::_5 => Some(4),
+        gdk::Key::_6 => Some(5),
+        gdk::Key::_7 => Some(6),
+        gdk::Key::_8 => Some(7),
+        gdk::Key::_9 => Some(8),
+        _ => None,
+    }
 }
 
 fn build_terminal_tab_label() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label) {
