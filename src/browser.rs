@@ -101,11 +101,30 @@ pub fn build() -> BrowserPanel {
 }
 
 fn urlencoded(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            ' ' => '+'.to_string(),
-            c if c.is_alphanumeric() || "-_.~".contains(c) => c.to_string(),
-            c => format!("%{:02X}", c as u32),
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b' ' => out.push('+'),
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urlencoded;
+
+    #[test]
+    fn encodes_utf8_bytes_not_codepoints() {
+        assert_eq!(urlencoded("a b"), "a+b");
+        assert_eq!(urlencoded("rust lang"), "rust+lang");
+        // € is U+20AC = E2 82 AC in UTF-8
+        assert_eq!(urlencoded("€"), "%E2%82%AC");
+        assert_eq!(urlencoded("naïve"), "na%C3%AFve");
+        assert_eq!(urlencoded("a-_.~z"), "a-_.~z");
+    }
 }
