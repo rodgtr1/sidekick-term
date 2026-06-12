@@ -303,9 +303,10 @@ scripts/install-agent-status-hooks
 The installer builds `sidekick-agent-status` and `sidekick-hook`, installs both
 to `~/.local/bin`, and adds hooks to `~/.claude/settings.json` and
 `~/.codex/config.toml`. For Claude Code that includes `PreToolUse` → busy (an
-approved tool flips the dot back from green to yellow), `SessionEnd` → idle
-(closing a session clears its tab from the agents panel), and the
-`sidekick-hook` edit-review hook with a `Write|Edit|MultiEdit` matcher. When the
+approved tool flips the dot back from green to yellow) and `SessionEnd` → idle
+(closing a session clears its tab from the agents panel). The `sidekick-hook`
+edit-review hook (accept/reject diff tabs for every agent file edit) is opt-in:
+pass `--edit-review` to wire it with a `Write|Edit|MultiEdit` matcher. When the
 Pi coding agent is detected at `~/.pi/agent`, a status extension is installed to
 `~/.pi/agent/extensions/sidekick-status.ts`. The installer is idempotent — safe
 to re-run; existing hooks are kept. Restart any open Claude Code, Codex, or Pi
@@ -362,9 +363,9 @@ the update falls back to the focused terminal.
 can show proposed `Write`, `Edit`, and `MultiEdit` changes as diffs inside sidekick.
 Accepting the diff lets the edit proceed; rejecting exits with code `2`.
 
-`scripts/install-agent-status-hooks` registers it automatically (a `PreToolUse`
-hook with a `Write|Edit|MultiEdit` matcher in `~/.claude/settings.json`). To wire
-it manually instead:
+`scripts/install-agent-status-hooks --edit-review` registers it (a `PreToolUse`
+hook with a `Write|Edit|MultiEdit` matcher in `~/.claude/settings.json`); without
+the flag the binary is installed but not wired. To wire it manually instead:
 
 ```bash
 mkdir -p ~/.claude/hooks/PreToolUse

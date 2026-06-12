@@ -6,13 +6,27 @@ bin_dir="${HOME}/.local/bin"
 status_bin="${bin_dir}/sidekick-agent-status"
 hook_bin="${bin_dir}/sidekick-hook"
 
+# The edit-review hook opens an accept/reject diff tab in sidekick for every
+# agent file edit, on top of the diff the agent already shows in its own
+# session. Wire it only when explicitly requested.
+edit_review=0
+for arg in "$@"; do
+    case "$arg" in
+        --edit-review) edit_review=1 ;;
+        *)
+            echo "usage: $(basename "$0") [--edit-review]" >&2
+            exit 1
+            ;;
+    esac
+done
+
 mkdir -p "$bin_dir"
 cargo build --release --manifest-path "$repo/Cargo.toml" \
     --bin sidekick-agent-status --bin sidekick-hook
 install -m 0755 "$repo/target/release/sidekick-agent-status" "$status_bin"
 install -m 0755 "$repo/target/release/sidekick-hook" "$hook_bin"
 
-python3 - "$HOME/.claude/settings.json" "$status_bin" "$hook_bin" <<'PY'
+python3 - "$HOME/.claude/settings.json" "$status_bin" "$hook_bin" "$edit_review" <<'PY'
 import json
 import pathlib
 import sys
@@ -20,6 +34,7 @@ import sys
 path = pathlib.Path(sys.argv[1])
 status_bin = sys.argv[2]
 hook_bin = sys.argv[3]
+edit_review = sys.argv[4] == "1"
 path.parent.mkdir(parents=True, exist_ok=True)
 
 if path.exists() and path.read_text().strip():
@@ -51,8 +66,11 @@ add_hook("PreToolUse", f"{status_bin} busy")
 add_hook("Stop", f"{status_bin} done")
 # Clears the tab from the agents panel when the session ends.
 add_hook("SessionEnd", f"{status_bin} idle")
-# Show file edits in Sidekick for accept/reject before they're applied.
-add_hook("PreToolUse", hook_bin, matcher="Write|Edit|MultiEdit")
+# Opt-in: show file edits in Sidekick for accept/reject before they're
+# applied. The agent session already displays its own diff, so this is a
+# second review surface — only wire it when asked.
+if edit_review:
+    add_hook("PreToolUse", hook_bin, matcher="Write|Edit|MultiEdit")
 
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
@@ -127,6 +145,12 @@ else
     pi_note="  (Pi not detected at ~/.pi/agent — extension skipped)"
 fi
 
+if [ "$edit_review" = "1" ]; then
+    edit_review_note="  edit-review hook wired (accept/reject diffs in sidekick)"
+else
+    edit_review_note="  edit-review hook NOT wired (re-run with --edit-review to enable)"
+fi
+
 cat <<EOF
 Installed sidekick-agent-status and sidekick-hook to:
   $bin_dir
@@ -135,6 +159,7 @@ Updated:
   $HOME/.claude/settings.json
   $HOME/.codex/config.toml
 $pi_note
+$edit_review_note
 
 Restart Claude Code/Codex/Pi sessions for hook changes to take effect.
 EOF
