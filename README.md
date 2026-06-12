@@ -17,9 +17,10 @@ window.
 - File tree sidebar that follows the focused terminal's current directory.
 - Built-in editor tabs powered by GtkSourceView, with syntax highlighting, line
   numbers, bracket matching, auto-indent, and `Ctrl+S` saves.
-- Git changes panel for the active repository, split into staged and unstaged
-  files.
-- Read-only colored diff tabs for changed files.
+- Git changes panel for the active repository, split into conflicted, staged,
+  and unstaged files, with ahead/behind counts on the push and pull buttons.
+- Read-only colored diff tabs for changed files; conflicted files open a
+  marker-highlighted view with ours/base/theirs sections tinted.
 - Optional embedded browser panel for quick docs/searches.
 - Configurable terminal font, cursor, padding, scrollback, hyperlink behavior,
   bell, and opacity.
@@ -29,9 +30,11 @@ window.
   launch.
 - Desktop notifications and an activity-bar badge when agents are waiting.
 - Agents dashboard panel: every tab's agent state with elapsed time; click a
-  row to jump to that tab.
-- Hosts panel listing `~/.ssh/config` entries and Teleport (`tsh`) nodes;
-  activating a host opens a connected tab.
+  row to jump to that tab. `Ctrl+Shift+J` jumps to the next tab whose agent
+  wants attention.
+- Hosts panel listing `~/.ssh/config` entries and, opt-in via
+  `[hosts] show_teleport`, Teleport (`tsh`) nodes — including Beam instances
+  by alias; activating a host opens a connected tab.
 - Command palette (`Ctrl+Shift+P`) and a keyboard shortcuts help window
   (`Ctrl+Shift+?`).
 - Desktop notification when a command running 15s+ finishes while the window
@@ -132,6 +135,11 @@ will show that directory's file tree and git changes.
 
 Open files by activating them in the file tree. Directories expand in place.
 Changed git files open as read-only diff tabs when activated from the git panel.
+Conflicted files (a merge/rebase gone sideways) appear in a CONFLICTS section:
+activating one opens the working-tree file with the `<<<<<<<`/`=======`/`>>>>>>>`
+markers highlighted, and right-click → "Mark resolved (stage)" stages it once
+fixed. The push and pull buttons show how many commits the branch is ahead or
+behind its upstream.
 File-tree files can open either in the built-in editor or in a new `nvim`
 terminal tab, based on the `[editor]` configuration.
 
@@ -147,6 +155,7 @@ terminal tab, based on the `[editor]` configuration.
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+Shift+Tab` | Previous tab |
 | `Ctrl+1` … `Ctrl+9` | Jump to tab 1–9 |
+| `Ctrl+Shift+J` | Jump to next tab whose agent wants attention (waiting first, then done, then running) |
 | `Ctrl+Shift+D` | Split terminal right |
 | `Ctrl+Shift+X` | Split terminal down |
 | `Alt+Left` | Focus previous terminal pane |
@@ -214,6 +223,11 @@ restore_session = true
 # builtin | nvim
 file_manager_open = "builtin"
 word_wrap = true
+
+[hosts]
+# Show Teleport nodes (`tsh ls`) in the Hosts panel. When false, tsh is
+# never invoked at all.
+show_teleport = false
 ```
 
 The session is saved to `~/.local/state/sidekick/session.json` when the
@@ -286,11 +300,17 @@ From a fresh clone, install the status helper and merge Claude/Codex hook config
 scripts/install-agent-status-hooks
 ```
 
-The installer builds `sidekick-agent-status`, installs it to `~/.local/bin`, and
-adds hooks to `~/.claude/settings.json` and `~/.codex/config.toml`. Restart any
-open Claude Code or Codex sessions after running it. The exact config snippets
-are also available in `examples/claude/settings.json` and
-`examples/codex/config.toml`.
+The installer builds `sidekick-agent-status` and `sidekick-hook`, installs both
+to `~/.local/bin`, and adds hooks to `~/.claude/settings.json` and
+`~/.codex/config.toml`. For Claude Code that includes `PreToolUse` → busy (an
+approved tool flips the dot back from green to yellow), `SessionEnd` → idle
+(closing a session clears its tab from the agents panel), and the
+`sidekick-hook` edit-review hook with a `Write|Edit|MultiEdit` matcher. When the
+Pi coding agent is detected at `~/.pi/agent`, a status extension is installed to
+`~/.pi/agent/extensions/sidekick-status.ts`. The installer is idempotent — safe
+to re-run; existing hooks are kept. Restart any open Claude Code, Codex, or Pi
+sessions after running it. The exact config snippets are also available in
+`examples/claude/settings.json` and `examples/codex/config.toml`.
 
 For zsh:
 
@@ -342,7 +362,9 @@ the update falls back to the focused terminal.
 can show proposed `Write`, `Edit`, and `MultiEdit` changes as diffs inside sidekick.
 Accepting the diff lets the edit proceed; rejecting exits with code `2`.
 
-Build or install sidekick, then place the hook where Claude Code expects it:
+`scripts/install-agent-status-hooks` registers it automatically (a `PreToolUse`
+hook with a `Write|Edit|MultiEdit` matcher in `~/.claude/settings.json`). To wire
+it manually instead:
 
 ```bash
 mkdir -p ~/.claude/hooks/PreToolUse
@@ -372,10 +394,24 @@ any existing hooks:
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sidekick-agent-status busy" }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           { "type": "command", "command": "sidekick-agent-status done" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sidekick-agent-status idle" }
         ]
       }
     ]

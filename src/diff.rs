@@ -321,10 +321,7 @@ pub enum ConflictSection {
 /// in. Markers are only honored in the order git writes them, so separator
 /// lines in ordinary content (a Markdown `=======` underline, say) read as
 /// plain text.
-pub fn conflict_line_tag(
-    line: &str,
-    section: ConflictSection,
-) -> (&'static str, ConflictSection) {
+pub fn conflict_line_tag(line: &str, section: ConflictSection) -> (&'static str, ConflictSection) {
     use ConflictSection::*;
     if line.starts_with("<<<<<<<") {
         return ("marker", Ours);
