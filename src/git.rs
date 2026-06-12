@@ -222,19 +222,37 @@ pub fn current_branch(root: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn ahead_count(root: &str) -> u32 {
+/// (ahead, behind) of the current branch's upstream, from one
+/// `git rev-list --left-right --count @{u}...HEAD` call. (0, 0) when no
+/// upstream is configured (e.g. branch never pushed).
+pub fn ahead_behind(root: &str) -> (u32, u32) {
     let out = Command::new("git")
-        .args(["-C", root, "rev-list", "--count", "@{u}..HEAD"])
+        .args([
+            "-C",
+            root,
+            "rev-list",
+            "--left-right",
+            "--count",
+            "@{u}...HEAD",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
     match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0),
-        _ => 0,
+        Ok(o) if o.status.success() => {
+            parse_ahead_behind(&String::from_utf8_lossy(&o.stdout)).unwrap_or((0, 0))
+        }
+        _ => (0, 0),
     }
+}
+
+/// Parse rev-list --left-right --count output ("<behind>\t<ahead>") into
+/// (ahead, behind).
+fn parse_ahead_behind(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.trim().split('\t');
+    let behind: u32 = parts.next()?.parse().ok()?;
+    let ahead: u32 = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
 }
 
 pub fn stage(root: &str, rel_path: &str) -> Result<(), String> {
@@ -315,5 +333,24 @@ pub fn push(cwd: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ahead_behind_counts() {
+        // git prints "<behind>\t<ahead>" (left = upstream-only commits).
+        assert_eq!(parse_ahead_behind("2\t3\n"), Some((3, 2)));
+        assert_eq!(parse_ahead_behind("0\t0"), Some((0, 0)));
+    }
+
+    #[test]
+    fn rejects_malformed_ahead_behind() {
+        assert_eq!(parse_ahead_behind(""), None);
+        assert_eq!(parse_ahead_behind("nonsense"), None);
+        assert_eq!(parse_ahead_behind("1"), None);
     }
 }

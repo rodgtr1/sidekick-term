@@ -106,6 +106,7 @@ enum UiResult {
         root: String,
         files: Vec<git::GitFile>,
         ahead: u32,
+        behind: u32,
         branch: Option<String>,
     },
     Diff {
@@ -537,13 +538,14 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
             std::thread::spawn(move || {
                 let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
                 let files = git::changed_files(&root);
-                let ahead = git::ahead_count(&root);
+                let (ahead, behind) = git::ahead_behind(&root);
                 let branch = git::current_branch(&root);
                 let _ = tx.send_blocking(UiResult::Git {
                     cwd,
                     root,
                     files,
                     ahead,
+                    behind,
                     branch,
                 });
             });
@@ -615,6 +617,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                         root,
                         files,
                         ahead,
+                        behind,
                         branch,
                     } => {
                         git_busy_c.set(false);
@@ -636,6 +639,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                                 gitpanel::populate(&git_list_c, &files, &root, &refresh_git_c);
                             *git_files_c.borrow_mut() = files;
                             gitpanel::update_push_button(&push_btn_c, ahead);
+                            gitpanel::update_pull_button(&pull_btn_c, behind);
                             gitpanel::update_commit_button(&commit_btn_c, staged_count);
                         }
                     }
@@ -649,6 +653,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                         Ok(()) => {
                             push_btn_c.set_label("↑  push");
                             push_btn_c.set_sensitive(true);
+                            refresh_git_c();
                         }
                         Err(msg) => {
                             push_btn_c.set_sensitive(true);
@@ -757,13 +762,14 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 std::thread::spawn(move || {
                     let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
                     let files = git::changed_files(&cwd);
-                    let ahead = git::ahead_count(&cwd);
+                    let (ahead, behind) = git::ahead_behind(&root);
                     let branch = git::current_branch(&root);
                     let _ = tx.send_blocking(UiResult::Git {
                         cwd,
                         root,
                         files,
                         ahead,
+                        behind,
                         branch,
                     });
                 });

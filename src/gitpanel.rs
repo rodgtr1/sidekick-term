@@ -124,6 +124,14 @@ pub fn update_push_button(btn: &gtk4::Button, ahead: u32) {
     }
 }
 
+pub fn update_pull_button(btn: &gtk4::Button, behind: u32) {
+    if behind == 0 {
+        btn.set_label("↓  pull");
+    } else {
+        btn.set_label(&format!("↓  pull  {behind}"));
+    }
+}
+
 pub fn update_commit_button(btn: &gtk4::Button, staged_count: usize) {
     btn.set_sensitive(staged_count > 0);
 }
