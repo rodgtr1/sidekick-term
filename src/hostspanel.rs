@@ -1,4 +1,6 @@
 use gtk4::prelude::*;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// Sidebar panel listing connectable hosts: `Host` entries from
 /// ~/.ssh/config and Teleport nodes from `tsh ls`. Activating a row opens a
@@ -7,6 +9,7 @@ pub struct HostsPanel {
     pub widget: gtk4::Box,
     pub list: gtk4::ListBox,
     pub refresh_btn: gtk4::Button,
+    show_teleport: Rc<Cell<bool>>,
 }
 
 enum Item {
@@ -15,7 +18,7 @@ enum Item {
     Message(String),
 }
 
-pub fn build() -> HostsPanel {
+pub fn build(show_teleport: bool) -> HostsPanel {
     let widget = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     let header_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -49,12 +52,14 @@ pub fn build() -> HostsPanel {
         widget,
         list,
         refresh_btn,
+        show_teleport: Rc::new(Cell::new(show_teleport)),
     };
     panel.refresh();
     {
         let list = panel.list.clone();
+        let show = Rc::clone(&panel.show_teleport);
         panel.refresh_btn.connect_clicked(move |_| {
-            refresh_list(&list);
+            refresh_list(&list, show.get());
         });
     }
     panel
@@ -62,12 +67,20 @@ pub fn build() -> HostsPanel {
 
 impl HostsPanel {
     pub fn refresh(&self) {
-        refresh_list(&self.list);
+        refresh_list(&self.list, self.show_teleport.get());
+    }
+
+    /// Enable or disable the Teleport section. When disabled, tsh is never
+    /// invoked at all. Refreshes the list when the value changes.
+    pub fn set_show_teleport(&self, show: bool) {
+        if self.show_teleport.replace(show) != show {
+            self.refresh();
+        }
     }
 }
 
 /// Gather hosts on a worker thread, then rebuild the list on the main loop.
-fn refresh_list(list: &gtk4::ListBox) {
+fn refresh_list(list: &gtk4::ListBox, show_teleport: bool) {
     let (tx, rx) = async_channel::bounded::<Vec<Item>>(1);
     std::thread::spawn(move || {
         let mut items = Vec::new();
@@ -91,23 +104,25 @@ fn refresh_list(list: &gtk4::ListBox) {
             });
         }
 
-        items.push(Item::Header("TELEPORT".to_string()));
-        match teleport_nodes() {
-            Ok(nodes) if nodes.is_empty() => {
-                items.push(Item::Message("No teleport nodes".to_string()));
-            }
-            Ok(nodes) => {
-                for node in nodes {
-                    if !is_safe_host(&node) {
-                        continue;
-                    }
-                    items.push(Item::Host {
-                        command: format!("tsh ssh {node}"),
-                        name: node,
-                    });
+        if show_teleport {
+            items.push(Item::Header("TELEPORT".to_string()));
+            match teleport_nodes() {
+                Ok(nodes) if nodes.is_empty() => {
+                    items.push(Item::Message("No teleport nodes".to_string()));
                 }
+                Ok(nodes) => {
+                    for node in nodes {
+                        if !is_safe_host(&node.name) {
+                            continue;
+                        }
+                        items.push(Item::Host {
+                            name: node.name,
+                            command: node.command,
+                        });
+                    }
+                }
+                Err(message) => items.push(Item::Message(message)),
             }
-            Err(message) => items.push(Item::Message(message)),
         }
 
         let _ = tx.send_blocking(items);
@@ -121,8 +136,13 @@ fn refresh_list(list: &gtk4::ListBox) {
     });
 }
 
-/// Hostnames from `tsh ls --format=json`, or a short status message.
-fn teleport_nodes() -> Result<Vec<String>, String> {
+pub struct TeleportNode {
+    pub name: String,
+    pub command: String,
+}
+
+/// Teleport nodes from `tsh ls --format=json`, or a short status message.
+fn teleport_nodes() -> Result<Vec<TeleportNode>, String> {
     let output = std::process::Command::new("tsh")
         .args(["ls", "--format=json"])
         .output()
@@ -134,18 +154,40 @@ fn teleport_nodes() -> Result<Vec<String>, String> {
     }
     let nodes: serde_json::Value =
         serde_json::from_slice(&output.stdout).map_err(|_| "tsh: bad output".to_string())?;
-    let mut names: Vec<String> = nodes
+    Ok(parse_teleport_nodes(&nodes))
+}
+
+/// (display name, connect command) for each node. Beam instances list as
+/// nodes with a beam-<uuid> hostname that `tsh ssh` can't dial — they carry
+/// a friendly alias in their labels and connect via `tsh beams ssh`.
+fn parse_teleport_nodes(nodes: &serde_json::Value) -> Vec<TeleportNode> {
+    let mut out: Vec<TeleportNode> = nodes
         .as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(|n| n["spec"]["hostname"].as_str())
-                .map(|s| s.to_string())
+                .filter_map(|n| {
+                    if let Some(alias) =
+                        n["metadata"]["labels"]["teleport.internal/beams/alias"].as_str()
+                    {
+                        return Some(TeleportNode {
+                            name: alias.to_string(),
+                            command: format!("tsh beams ssh {alias}"),
+                        });
+                    }
+                    let hostname = n["spec"]["hostname"]
+                        .as_str()
+                        .or_else(|| n["metadata"]["name"].as_str())?;
+                    Some(TeleportNode {
+                        name: hostname.to_string(),
+                        command: format!("tsh ssh {hostname}"),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
-    names.sort();
-    names.dedup();
-    Ok(names)
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
 }
 
 /// Hostnames we are willing to interpolate into a shell command. Conservative
@@ -250,6 +292,34 @@ mod tests {
     fn skips_non_host_lines_and_dedupes() {
         let config = "# Host commented\nHostName not-a-host\nHost a\nHost a\n";
         assert_eq!(parse_ssh_config(config), vec!["a"]);
+    }
+
+    #[test]
+    fn parses_plain_and_beam_nodes() {
+        let json = serde_json::json!([
+            {"spec": {"hostname": "web-1"}, "metadata": {"labels": {"env": "prod"}}},
+            {"spec": {"hostname": "beam-3f2a"}, "metadata": {"labels": {"teleport.internal/beams/alias": "my-beam"}}},
+        ]);
+        let nodes = parse_teleport_nodes(&json);
+        assert_eq!(nodes.len(), 2);
+        // Sorted by name: my-beam, web-1.
+        assert_eq!(nodes[0].name, "my-beam");
+        assert_eq!(nodes[0].command, "tsh beams ssh my-beam");
+        assert_eq!(nodes[1].name, "web-1");
+        assert_eq!(nodes[1].command, "tsh ssh web-1");
+    }
+
+    #[test]
+    fn teleport_nodes_fall_back_to_metadata_name_and_dedupe() {
+        let json = serde_json::json!([
+            {"metadata": {"name": "named-only"}},
+            {"spec": {"hostname": "dup"}},
+            {"spec": {"hostname": "dup"}},
+            {"spec": {}},
+        ]);
+        let nodes = parse_teleport_nodes(&json);
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["dup", "named-only"]);
     }
 
     #[test]

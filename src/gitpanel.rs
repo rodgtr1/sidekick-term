@@ -124,6 +124,14 @@ pub fn update_push_button(btn: &gtk4::Button, ahead: u32) {
     }
 }
 
+pub fn update_pull_button(btn: &gtk4::Button, behind: u32) {
+    if behind == 0 {
+        btn.set_label("↓  pull");
+    } else {
+        btn.set_label(&format!("↓  pull  {behind}"));
+    }
+}
+
 pub fn update_commit_button(btn: &gtk4::Button, staged_count: usize) {
     btn.set_sensitive(staged_count > 0);
 }
@@ -152,9 +160,26 @@ pub fn populate(
         return 0;
     }
 
-    let staged: Vec<_> = files.iter().filter(|f| f.staged).collect();
-    let unstaged: Vec<_> = files.iter().filter(|f| !f.staged).collect();
+    let conflicted: Vec<_> = files
+        .iter()
+        .filter(|f| f.status == git::GitStatus::Conflicted)
+        .collect();
+    let staged: Vec<_> = files
+        .iter()
+        .filter(|f| f.staged && f.status != git::GitStatus::Conflicted)
+        .collect();
+    let unstaged: Vec<_> = files
+        .iter()
+        .filter(|f| !f.staged && f.status != git::GitStatus::Conflicted)
+        .collect();
     let staged_count = staged.len();
+
+    if !conflicted.is_empty() {
+        add_section_header(list, "CONFLICTS");
+        for file in &conflicted {
+            add_file_row(list, file, false, root, on_refresh);
+        }
+    }
 
     if !staged.is_empty() {
         add_section_header(list, "STAGED");
@@ -231,6 +256,7 @@ fn add_file_row(
     let rel_path = file.rel_path.clone();
     let root_s = root.to_string();
     let is_untracked = file.status == git::GitStatus::Untracked;
+    let is_conflicted = file.status == git::GitStatus::Conflicted;
     let refresh = Rc::clone(on_refresh);
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(3);
@@ -246,6 +272,7 @@ fn add_file_row(
             &rel_path,
             &root_s,
             is_untracked,
+            is_conflicted,
             &refresh,
         );
         gesture.set_state(gtk4::EventSequenceState::Claimed);
@@ -266,6 +293,7 @@ fn show_git_error(widget: &gtk4::Widget, msg: &str) {
         .show(window.as_ref());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_context_menu(
     parent: &gtk4::Widget,
     x: f64,
@@ -274,6 +302,7 @@ fn show_context_menu(
     rel_path: &str,
     root: &str,
     is_untracked: bool,
+    is_conflicted: bool,
     on_refresh: &Rc<dyn Fn()>,
 ) {
     let popover = gtk4::Popover::new();
@@ -283,7 +312,19 @@ fn show_context_menu(
 
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
-    if staged {
+    if is_conflicted {
+        // Staging an unmerged path tells git the conflict is resolved.
+        add_menu_item(&vbox, "Mark resolved (stage)", &popover, {
+            let path = rel_path.to_string();
+            let root = root.to_string();
+            let refresh = Rc::clone(on_refresh);
+            let parent_w = parent.clone();
+            move || match git::stage(&root, &path) {
+                Ok(()) => refresh(),
+                Err(e) => show_git_error(&parent_w, &e),
+            }
+        });
+    } else if staged {
         add_menu_item(&vbox, "Unstage", &popover, {
             let path = rel_path.to_string();
             let root = root.to_string();

@@ -11,6 +11,7 @@ pub struct Config {
     pub window: WindowConfig,
     pub behavior: BehaviorConfig,
     pub editor: EditorConfig,
+    pub hosts: HostsConfig,
     pub tasks: Vec<crate::runpanel::Task>,
 }
 
@@ -53,6 +54,14 @@ pub struct BehaviorConfig {
     pub mouse_autohide: bool,
     pub audible_bell: bool,
     pub restore_session: bool,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct HostsConfig {
+    /// Show Teleport nodes (from `tsh ls`) in the Hosts panel. Off by
+    /// default so tsh is never invoked unless asked for.
+    pub show_teleport: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -164,6 +173,11 @@ file_manager_open = "builtin"
 # Wrap long lines in the editor (true = word wrap, false = horizontal scroll)
 word_wrap = true
 
+[hosts]
+# Show Teleport nodes (`tsh ls`) in the Hosts panel. When false, tsh is
+# never invoked at all.
+show_teleport = false
+
 # Global run-panel tasks (available in every project)
 # [[tasks]]
 # name = "My task"
@@ -221,5 +235,12 @@ mod tests {
     #[test]
     fn invalid_config_is_err() {
         assert!(parse_config("this is = = not toml").is_err());
+    }
+
+    #[test]
+    fn hosts_show_teleport_parses_and_defaults_off() {
+        let cfg = parse_config("[hosts]\nshow_teleport = true\n").expect("valid");
+        assert!(cfg.hosts.show_teleport);
+        assert!(!parse_config("").expect("valid").hosts.show_teleport);
     }
 }

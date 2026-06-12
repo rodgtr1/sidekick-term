@@ -9,6 +9,7 @@ pub enum GitStatus {
     Added,
     Deleted,
     Untracked,
+    Conflicted,
     Other,
 }
 
@@ -19,6 +20,7 @@ impl GitStatus {
             GitStatus::Added => "A",
             GitStatus::Deleted => "D",
             GitStatus::Untracked => "?",
+            GitStatus::Conflicted => "U",
             GitStatus::Other => "~",
         }
     }
@@ -28,6 +30,7 @@ impl GitStatus {
             GitStatus::Added => "#a6e3a1",
             GitStatus::Deleted => "#f38ba8",
             GitStatus::Untracked => "#89b4fa",
+            GitStatus::Conflicted => "#fab387",
             GitStatus::Other => "#6c7086",
         }
     }
@@ -39,6 +42,12 @@ pub struct GitFile {
     pub abs_path: String,
     pub status: GitStatus,
     pub staged: bool,
+}
+
+/// Unmerged entry from a conflicted merge/rebase/cherry-pick:
+/// UU, AU, UA, DU, UD, AA or DD in porcelain output.
+pub fn is_conflict_xy(x: char, y: char) -> bool {
+    x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D')
 }
 
 pub fn ignored_set(root: &str) -> std::collections::HashSet<String> {
@@ -93,6 +102,10 @@ pub fn changed_files(root: &str) -> Vec<GitFile> {
         Ok(out) => out,
         Err(_) => return vec![],
     };
+    parse_porcelain(&out, root)
+}
+
+fn parse_porcelain(out: &[u8], root: &str) -> Vec<GitFile> {
     let mut files = Vec::new();
     let mut records = out.split(|b| *b == 0);
     while let Some(record) = records.next() {
@@ -113,6 +126,18 @@ pub fn changed_files(root: &str) -> Vec<GitFile> {
                 rel_path: rel.to_string(),
                 abs_path: format!("{}/{}", root, rel),
                 status: GitStatus::Untracked,
+                staged: false,
+            });
+            continue;
+        }
+
+        // A conflicted file isn't staged or unstaged in any useful sense —
+        // one entry; the action that resolves it is Stage.
+        if is_conflict_xy(x, y) {
+            files.push(GitFile {
+                rel_path: rel.to_string(),
+                abs_path: format!("{}/{}", root, rel),
+                status: GitStatus::Conflicted,
                 staged: false,
             });
             continue;
@@ -211,6 +236,16 @@ pub fn file_diff(root: &str, file: &GitFile) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "Diff is not valid UTF-8 text.".to_string())
 }
 
+/// Working-tree contents of a conflicted file. Unmerged paths can't be
+/// diffed against the index (`git diff` emits combined-diff format), so the
+/// viewer shows the raw file with its conflict markers instead.
+pub fn conflict_file_content(root: &str, rel_path: &str) -> Result<String, String> {
+    crate::limits::read_text_file_limited(
+        &format!("{root}/{rel_path}"),
+        crate::limits::MAX_DIFF_BYTES as u64,
+    )
+}
+
 pub fn current_branch(root: &str) -> Option<String> {
     Command::new("git")
         .args(["-C", root, "branch", "--show-current"])
@@ -222,19 +257,37 @@ pub fn current_branch(root: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn ahead_count(root: &str) -> u32 {
+/// (ahead, behind) of the current branch's upstream, from one
+/// `git rev-list --left-right --count @{u}...HEAD` call. (0, 0) when no
+/// upstream is configured (e.g. branch never pushed).
+pub fn ahead_behind(root: &str) -> (u32, u32) {
     let out = Command::new("git")
-        .args(["-C", root, "rev-list", "--count", "@{u}..HEAD"])
+        .args([
+            "-C",
+            root,
+            "rev-list",
+            "--left-right",
+            "--count",
+            "@{u}...HEAD",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
     match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0),
-        _ => 0,
+        Ok(o) if o.status.success() => {
+            parse_ahead_behind(&String::from_utf8_lossy(&o.stdout)).unwrap_or((0, 0))
+        }
+        _ => (0, 0),
     }
+}
+
+/// Parse rev-list --left-right --count output ("<behind>\t<ahead>") into
+/// (ahead, behind).
+fn parse_ahead_behind(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.trim().split('\t');
+    let behind: u32 = parts.next()?.parse().ok()?;
+    let ahead: u32 = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
 }
 
 pub fn stage(root: &str, rel_path: &str) -> Result<(), String> {
@@ -315,5 +368,61 @@ pub fn push(cwd: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ahead_behind_counts() {
+        // git prints "<behind>\t<ahead>" (left = upstream-only commits).
+        assert_eq!(parse_ahead_behind("2\t3\n"), Some((3, 2)));
+        assert_eq!(parse_ahead_behind("0\t0"), Some((0, 0)));
+    }
+
+    #[test]
+    fn rejects_malformed_ahead_behind() {
+        assert_eq!(parse_ahead_behind(""), None);
+        assert_eq!(parse_ahead_behind("nonsense"), None);
+        assert_eq!(parse_ahead_behind("1"), None);
+    }
+
+    #[test]
+    fn detects_conflict_status_codes() {
+        for (x, y) in [
+            ('U', 'U'),
+            ('A', 'U'),
+            ('U', 'A'),
+            ('D', 'U'),
+            ('U', 'D'),
+            ('A', 'A'),
+            ('D', 'D'),
+        ] {
+            assert!(is_conflict_xy(x, y), "{x}{y} should be a conflict");
+        }
+        assert!(!is_conflict_xy('M', 'M'));
+        assert!(!is_conflict_xy('A', ' '));
+        assert!(!is_conflict_xy('?', '?'));
+        assert!(!is_conflict_xy(' ', 'D'));
+    }
+
+    #[test]
+    fn porcelain_conflict_yields_single_unstaged_entry() {
+        let files = parse_porcelain(b"UU both.txt\0", "/r");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, GitStatus::Conflicted);
+        assert!(!files[0].staged);
+        assert_eq!(files[0].rel_path, "both.txt");
+        assert_eq!(files[0].abs_path, "/r/both.txt");
+    }
+
+    #[test]
+    fn porcelain_partially_staged_still_yields_two_entries() {
+        let files = parse_porcelain(b"MM file.txt\0", "/r");
+        assert_eq!(files.len(), 2);
+        assert!(files[0].staged);
+        assert!(!files[1].staged);
     }
 }

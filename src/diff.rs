@@ -309,6 +309,111 @@ pub fn open_readonly(title: &str, diff_text: &str, notebook: &gtk4::Notebook) {
     view.grab_focus();
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ConflictSection {
+    None,
+    Ours,
+    Base,
+    Theirs,
+}
+
+/// Tag for one line of a conflicted file plus the section the next line is
+/// in. Markers are only honored in the order git writes them, so separator
+/// lines in ordinary content (a Markdown `=======` underline, say) read as
+/// plain text.
+pub fn conflict_line_tag(line: &str, section: ConflictSection) -> (&'static str, ConflictSection) {
+    use ConflictSection::*;
+    if line.starts_with("<<<<<<<") {
+        return ("marker", Ours);
+    }
+    if line.starts_with("|||||||") && section == Ours {
+        return ("marker", Base);
+    }
+    if line.starts_with("=======") && (section == Ours || section == Base) {
+        return ("marker", Theirs);
+    }
+    if line.starts_with(">>>>>>>") && section == Theirs {
+        return ("marker", None);
+    }
+    let tag = match section {
+        None => "plain",
+        Ours => "ours",
+        Base => "base",
+        Theirs => "theirs",
+    };
+    (tag, section)
+}
+
+/// Open a read-only view of a conflicted file's working-tree contents with
+/// the conflict markers highlighted and ours/base/theirs sections tinted.
+pub fn open_conflict(title: &str, content: &str, notebook: &gtk4::Notebook) {
+    if content.len() > crate::limits::MAX_DIFF_BYTES {
+        open_message(
+            "conflict too large",
+            title,
+            "File is too large to preview safely.",
+            notebook,
+        );
+        return;
+    }
+
+    let buffer = gtk4::TextBuffer::new(None::<&gtk4::TextTagTable>);
+    let tag_marker = buffer.create_tag(Some("marker"), &[]).unwrap();
+    tag_marker.set_property("foreground", "#f9e2af");
+    tag_marker.set_property("background", "#3a3326");
+    let tag_ours = buffer.create_tag(Some("ours"), &[]).unwrap();
+    tag_ours.set_property("background", "#16322f");
+    let tag_base = buffer.create_tag(Some("base"), &[]).unwrap();
+    tag_base.set_property("background", "#2a2b36");
+    let tag_theirs = buffer.create_tag(Some("theirs"), &[]).unwrap();
+    tag_theirs.set_property("background", "#1e2f4d");
+
+    let mut text = String::new();
+    let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut section = ConflictSection::None;
+    for line in content.lines() {
+        let (tag, next) = conflict_line_tag(line, section);
+        section = next;
+        let start = text.len();
+        text.push_str(line);
+        text.push('\n');
+        if tag != "plain" {
+            spans.push((start, text.len(), tag));
+        }
+    }
+
+    buffer.set_text(&text);
+    let mut boundaries = Vec::with_capacity(spans.len() * 2);
+    for (s, e, _) in &spans {
+        boundaries.push(*s);
+        boundaries.push(*e);
+    }
+    let chars = char_offsets(&text, &boundaries);
+    for (i, (_, _, tag)) in spans.iter().enumerate() {
+        let si = buffer.iter_at_offset(chars[i * 2] as i32);
+        let ei = buffer.iter_at_offset(chars[i * 2 + 1] as i32);
+        buffer.apply_tag_by_name(tag, &si, &ei);
+    }
+
+    let view = gtk4::TextView::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_monospace(true);
+    view.add_css_class("editor-view");
+
+    let scroll = gtk4::ScrolledWindow::new();
+    scroll.set_child(Some(&view));
+    scroll.set_vexpand(true);
+    scroll.set_hexpand(true);
+
+    let tab_label = gtk4::Label::new(Some(&format!("⚠ {}", title)));
+    let page_idx = notebook.n_pages();
+    notebook.append_page(&scroll, Some(&tab_label));
+    notebook.set_tab_reorderable(&scroll, true);
+    notebook.set_current_page(Some(page_idx));
+    view.grab_focus();
+}
+
 /// Convert a list of byte offsets into char offsets in a single pass.
 /// `byte_offsets` must be non-decreasing (diff spans are emitted in order).
 fn char_offsets(text: &str, byte_offsets: &[usize]) -> Vec<usize> {
@@ -332,6 +437,41 @@ fn char_offsets(text: &str, byte_offsets: &[usize]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::char_offsets;
+    use super::{conflict_line_tag, ConflictSection};
+
+    #[test]
+    fn classifies_conflict_sections_in_order() {
+        use ConflictSection::*;
+        let lines = [
+            ("plain text", "plain", None),
+            ("<<<<<<< HEAD", "marker", Ours),
+            ("our line", "ours", Ours),
+            ("||||||| base", "marker", Base),
+            ("base line", "base", Base),
+            ("=======", "marker", Theirs),
+            ("their line", "theirs", Theirs),
+            (">>>>>>> other", "marker", None),
+            ("after", "plain", None),
+        ];
+        let mut section = ConflictSection::None;
+        for (line, want_tag, want_section) in lines {
+            let (tag, next) = conflict_line_tag(line, section);
+            assert_eq!(tag, want_tag, "line: {line}");
+            assert_eq!(next, want_section, "line: {line}");
+            section = next;
+        }
+    }
+
+    #[test]
+    fn stray_separators_outside_conflicts_are_plain() {
+        // A bare ======= in ordinary content (e.g. a Markdown underline)
+        // must not start a section.
+        let (tag, next) = conflict_line_tag("=======", ConflictSection::None);
+        assert_eq!(tag, "plain");
+        assert_eq!(next, ConflictSection::None);
+        let (tag, _) = conflict_line_tag(">>>>>>> x", ConflictSection::None);
+        assert_eq!(tag, "plain");
+    }
 
     fn naive(text: &str, b: usize) -> usize {
         text[..b.min(text.len())].chars().count()

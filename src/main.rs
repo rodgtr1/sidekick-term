@@ -106,9 +106,14 @@ enum UiResult {
         root: String,
         files: Vec<git::GitFile>,
         ahead: u32,
+        behind: u32,
         branch: Option<String>,
     },
     Diff {
+        title: String,
+        result: Result<String, String>,
+    },
+    Conflict {
         title: String,
         result: Result<String, String>,
     },
@@ -210,7 +215,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     let agent_panel = Rc::new(agentpanel::build());
 
     // Hosts panel (ssh config + teleport)
-    let hosts_panel = hostspanel::build();
+    let hosts_panel = Rc::new(hostspanel::build(cfg.borrow().hosts.show_teleport));
 
     // File tree page (header + scroll stacked vertically)
     let files_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -537,13 +542,14 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
             std::thread::spawn(move || {
                 let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
                 let files = git::changed_files(&root);
-                let ahead = git::ahead_count(&root);
+                let (ahead, behind) = git::ahead_behind(&root);
                 let branch = git::current_branch(&root);
                 let _ = tx.send_blocking(UiResult::Git {
                     cwd,
                     root,
                     files,
                     ahead,
+                    behind,
                     branch,
                 });
             });
@@ -615,6 +621,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                         root,
                         files,
                         ahead,
+                        behind,
                         branch,
                     } => {
                         git_busy_c.set(false);
@@ -636,6 +643,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                                 gitpanel::populate(&git_list_c, &files, &root, &refresh_git_c);
                             *git_files_c.borrow_mut() = files;
                             gitpanel::update_push_button(&push_btn_c, ahead);
+                            gitpanel::update_pull_button(&pull_btn_c, behind);
                             gitpanel::update_commit_button(&commit_btn_c, staged_count);
                         }
                     }
@@ -645,10 +653,17 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                             diff::open_message("diff unavailable", &title, &message, &nb_c)
                         }
                     },
+                    UiResult::Conflict { title, result } => match result {
+                        Ok(content) => diff::open_conflict(&title, &content, &nb_c),
+                        Err(message) => {
+                            diff::open_message("conflict unavailable", &title, &message, &nb_c)
+                        }
+                    },
                     UiResult::Push { result } => match result {
                         Ok(()) => {
                             push_btn_c.set_label("↑  push");
                             push_btn_c.set_sensitive(true);
+                            refresh_git_c();
                         }
                         Err(msg) => {
                             push_btn_c.set_sensitive(true);
@@ -757,13 +772,14 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 std::thread::spawn(move || {
                     let root = git::repo_root(&cwd).unwrap_or_else(|| cwd.clone());
                     let files = git::changed_files(&cwd);
-                    let ahead = git::ahead_count(&cwd);
+                    let (ahead, behind) = git::ahead_behind(&root);
                     let branch = git::current_branch(&root);
                     let _ = tx.send_blocking(UiResult::Git {
                         cwd,
                         root,
                         files,
                         ahead,
+                        behind,
                         branch,
                     });
                 });
@@ -795,12 +811,21 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 let file = file.clone();
                 let title = file.rel_path.clone();
                 let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let result = git::repo_root(&cwd)
-                        .ok_or_else(|| "Not inside a git repository.".to_string())
-                        .and_then(|root| git::file_diff(&root, &file));
-                    let _ = tx.send_blocking(UiResult::Diff { title, result });
-                });
+                if file.status == git::GitStatus::Conflicted {
+                    std::thread::spawn(move || {
+                        let result = git::repo_root(&cwd)
+                            .ok_or_else(|| "Not inside a git repository.".to_string())
+                            .and_then(|root| git::conflict_file_content(&root, &file.rel_path));
+                        let _ = tx.send_blocking(UiResult::Conflict { title, result });
+                    });
+                } else {
+                    std::thread::spawn(move || {
+                        let result = git::repo_root(&cwd)
+                            .ok_or_else(|| "Not inside a git repository.".to_string())
+                            .and_then(|root| git::file_diff(&root, &file));
+                        let _ = tx.send_blocking(UiResult::Diff { title, result });
+                    });
+                }
             }
         });
     }
@@ -836,6 +861,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         let root_widget: gtk4::Widget = root_box.clone().upcast();
         let last_cwd = Rc::clone(&last_cwd);
         let populate_tasks = Rc::clone(&populate_tasks);
+        let hosts_panel_r = Rc::clone(&hosts_panel);
         move || {
             let next = match config::Config::load_checked() {
                 Ok(c) => c,
@@ -850,6 +876,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 let cfg_ref = cfg.borrow();
                 css.load_from_string(&build_css(&cfg_ref));
                 apply_config_to_open_widgets(&root_widget, &cfg_ref);
+                hosts_panel_r.set_show_teleport(cfg_ref.hosts.show_teleport);
             }
 
             let cwd = last_cwd.borrow().clone();
@@ -1328,6 +1355,28 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 // Toggle browser panel
                 (true, true, false, gdk::Key::o | gdk::Key::O) => {
                     toggle_browser_k();
+                    glib::Propagation::Stop
+                }
+                // Jump to the next tab whose agent wants attention
+                (true, true, false, gdk::Key::j | gdk::Key::J) => {
+                    let mut pages: Vec<(u32, AgentState)> = Vec::new();
+                    for i in 0..nb.n_pages() {
+                        let Some(page) = nb.nth_page(Some(i)) else {
+                            continue;
+                        };
+                        let Some(term) = pane::collect_terminals_pub(&page).into_iter().next()
+                        else {
+                            continue;
+                        };
+                        let key = term.as_ptr() as usize;
+                        if let Some((_, cell)) = agent_map_kb.borrow().get(&key) {
+                            pages.push((i, cell.get()));
+                        }
+                    }
+                    let current = nb.current_page().unwrap_or(0);
+                    if let Some(target) = attention_jump_target(&pages, current) {
+                        nb.set_current_page(Some(target));
+                    }
                     glib::Propagation::Stop
                 }
                 // Jump to tab N (Ctrl+1 .. Ctrl+9)
@@ -3188,6 +3237,36 @@ fn is_known_agent_command(command: &str) -> bool {
     command.contains("claude") || command.contains("codex")
 }
 
+/// Ctrl+Shift+J: the page to jump to among `pages` (page index, agent
+/// state), most urgent state first — waiting for input, then done, then
+/// running. Repeated presses walk all tabs in the chosen state. None when
+/// no tab wants attention or the only candidate is the current page.
+fn attention_jump_target(pages: &[(u32, AgentState)], current: u32) -> Option<u32> {
+    let groups: [&[AgentState]; 3] = [
+        &[AgentState::Ready],
+        &[AgentState::Done],
+        &[AgentState::Busy, AgentState::AutoBusy],
+    ];
+    for wanted in groups {
+        let mut candidates: Vec<u32> = pages
+            .iter()
+            .filter(|(_, s)| wanted.contains(s))
+            .map(|(i, _)| *i)
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_unstable();
+        let next = candidates
+            .iter()
+            .copied()
+            .find(|i| *i > current)
+            .unwrap_or(candidates[0]);
+        return (next != current).then_some(next);
+    }
+    None
+}
+
 /// Map Ctrl+1..Ctrl+9 to a zero-based tab index (1 -> 0, ... 9 -> 8).
 fn tab_jump_index(key: gdk::Key) -> Option<u32> {
     match key {
@@ -3691,4 +3770,42 @@ fn build_css(cfg: &config::Config) -> String {
         notebook_tab_width = NOTEBOOK_TAB_WIDTH,
         session_tab_width = SESSION_TAB_WIDTH,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attention_jump_prefers_waiting_tabs() {
+        let pages = [
+            (0, AgentState::Done),
+            (1, AgentState::Ready),
+            (2, AgentState::Busy),
+            (3, AgentState::Ready),
+        ];
+        // From tab 0, the first Ready tab after it wins — not the Done tab.
+        assert_eq!(attention_jump_target(&pages, 0), Some(1));
+        // Repeated presses walk all Ready tabs, wrapping around.
+        assert_eq!(attention_jump_target(&pages, 1), Some(3));
+        assert_eq!(attention_jump_target(&pages, 3), Some(1));
+    }
+
+    #[test]
+    fn attention_jump_falls_back_to_done_then_running() {
+        let pages = [(0, AgentState::Idle), (1, AgentState::Done)];
+        assert_eq!(attention_jump_target(&pages, 0), Some(1));
+        let pages = [(0, AgentState::Idle), (1, AgentState::AutoBusy)];
+        assert_eq!(attention_jump_target(&pages, 0), Some(1));
+    }
+
+    #[test]
+    fn attention_jump_none_when_nothing_to_do() {
+        assert_eq!(attention_jump_target(&[], 0), None);
+        let pages = [(0, AgentState::Idle), (1, AgentState::Idle)];
+        assert_eq!(attention_jump_target(&pages, 0), None);
+        // Only candidate is the current tab: stay put.
+        let pages = [(0, AgentState::Ready), (1, AgentState::Idle)];
+        assert_eq!(attention_jump_target(&pages, 0), None);
+    }
 }

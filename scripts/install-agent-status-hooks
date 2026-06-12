@@ -4,18 +4,22 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin_dir="${HOME}/.local/bin"
 status_bin="${bin_dir}/sidekick-agent-status"
+hook_bin="${bin_dir}/sidekick-hook"
 
 mkdir -p "$bin_dir"
-cargo build --release --manifest-path "$repo/Cargo.toml" --bin sidekick-agent-status
+cargo build --release --manifest-path "$repo/Cargo.toml" \
+    --bin sidekick-agent-status --bin sidekick-hook
 install -m 0755 "$repo/target/release/sidekick-agent-status" "$status_bin"
+install -m 0755 "$repo/target/release/sidekick-hook" "$hook_bin"
 
-python3 - "$HOME/.claude/settings.json" "$status_bin" <<'PY'
+python3 - "$HOME/.claude/settings.json" "$status_bin" "$hook_bin" <<'PY'
 import json
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 status_bin = sys.argv[2]
+hook_bin = sys.argv[3]
 path.parent.mkdir(parents=True, exist_ok=True)
 
 if path.exists() and path.read_text().strip():
@@ -25,18 +29,30 @@ else:
 
 hooks = data.setdefault("hooks", {})
 
-def add_hook(event, status):
-    command = f"{status_bin} {status}"
+def add_hook(event, command, matcher=None):
     groups = hooks.setdefault(event, [])
+    # Dedupe by binary name + argument so an existing install at another
+    # path (or by another installer) counts as already registered.
+    signature = command.split("/")[-1]
     for group in groups:
         for hook in group.get("hooks", []):
-            if hook.get("type") == "command" and hook.get("command") == command:
+            existing = hook.get("command", "")
+            if existing == command or existing.endswith(signature):
                 return
-    groups.append({"hooks": [{"type": "command", "command": command}]})
+    group = {"hooks": [{"type": "command", "command": command}]}
+    if matcher is not None:
+        group["matcher"] = matcher
+    groups.append(group)
 
-add_hook("UserPromptSubmit", "busy")
-add_hook("PermissionRequest", "ready")
-add_hook("Stop", "done")
+add_hook("UserPromptSubmit", f"{status_bin} busy")
+add_hook("PermissionRequest", f"{status_bin} ready")
+# Flips "ready" back to "busy" as soon as an approved tool starts running.
+add_hook("PreToolUse", f"{status_bin} busy")
+add_hook("Stop", f"{status_bin} done")
+# Clears the tab from the agents panel when the session ends.
+add_hook("SessionEnd", f"{status_bin} idle")
+# Show file edits in Sidekick for accept/reject before they're applied.
+add_hook("PreToolUse", hook_bin, matcher="Write|Edit|MultiEdit")
 
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
@@ -100,13 +116,25 @@ if "sidekick-agent-status busy" not in text:
 path.write_text(text)
 PY
 
+# Pi coding agent: status extension (only when Pi is present).
+pi_dir="${HOME}/.pi/agent"
+if [ -d "$pi_dir" ]; then
+    mkdir -p "$pi_dir/extensions"
+    install -m 0644 "$repo/scripts/pi-sidekick-status.ts" \
+        "$pi_dir/extensions/sidekick-status.ts"
+    pi_note="  $pi_dir/extensions/sidekick-status.ts"
+else
+    pi_note="  (Pi not detected at ~/.pi/agent — extension skipped)"
+fi
+
 cat <<EOF
-Installed sidekick-agent-status to:
-  $status_bin
+Installed sidekick-agent-status and sidekick-hook to:
+  $bin_dir
 
 Updated:
   $HOME/.claude/settings.json
   $HOME/.codex/config.toml
+$pi_note
 
-Restart Claude Code/Codex sessions for hook changes to take effect.
+Restart Claude Code/Codex/Pi sessions for hook changes to take effect.
 EOF
