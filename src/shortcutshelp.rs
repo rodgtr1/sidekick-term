@@ -7,6 +7,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+Shift+T", "New terminal tab"),
             ("Ctrl+1 … Ctrl+9", "Jump to tab 1–9"),
+            ("Ctrl+Shift+J", "Jump to next agent needing attention"),
             ("Ctrl+Shift+W", "Close pane / editor tab / diff tab"),
             ("Ctrl+Tab", "Next tab"),
             ("Ctrl+Shift+Tab", "Previous tab"),

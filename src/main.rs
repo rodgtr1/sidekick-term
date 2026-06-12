@@ -1355,6 +1355,28 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                     toggle_browser_k();
                     glib::Propagation::Stop
                 }
+                // Jump to the next tab whose agent wants attention
+                (true, true, false, gdk::Key::j | gdk::Key::J) => {
+                    let mut pages: Vec<(u32, AgentState)> = Vec::new();
+                    for i in 0..nb.n_pages() {
+                        let Some(page) = nb.nth_page(Some(i)) else {
+                            continue;
+                        };
+                        let Some(term) = pane::collect_terminals_pub(&page).into_iter().next()
+                        else {
+                            continue;
+                        };
+                        let key = term.as_ptr() as usize;
+                        if let Some((_, cell)) = agent_map_kb.borrow().get(&key) {
+                            pages.push((i, cell.get()));
+                        }
+                    }
+                    let current = nb.current_page().unwrap_or(0);
+                    if let Some(target) = attention_jump_target(&pages, current) {
+                        nb.set_current_page(Some(target));
+                    }
+                    glib::Propagation::Stop
+                }
                 // Jump to tab N (Ctrl+1 .. Ctrl+9)
                 (true, false, false, k) if tab_jump_index(k).is_some() => {
                     if let Some(i) = tab_jump_index(k) {
@@ -3213,6 +3235,36 @@ fn is_known_agent_command(command: &str) -> bool {
     command.contains("claude") || command.contains("codex")
 }
 
+/// Ctrl+Shift+J: the page to jump to among `pages` (page index, agent
+/// state), most urgent state first — waiting for input, then done, then
+/// running. Repeated presses walk all tabs in the chosen state. None when
+/// no tab wants attention or the only candidate is the current page.
+fn attention_jump_target(pages: &[(u32, AgentState)], current: u32) -> Option<u32> {
+    let groups: [&[AgentState]; 3] = [
+        &[AgentState::Ready],
+        &[AgentState::Done],
+        &[AgentState::Busy, AgentState::AutoBusy],
+    ];
+    for wanted in groups {
+        let mut candidates: Vec<u32> = pages
+            .iter()
+            .filter(|(_, s)| wanted.contains(s))
+            .map(|(i, _)| *i)
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_unstable();
+        let next = candidates
+            .iter()
+            .copied()
+            .find(|i| *i > current)
+            .unwrap_or(candidates[0]);
+        return (next != current).then_some(next);
+    }
+    None
+}
+
 /// Map Ctrl+1..Ctrl+9 to a zero-based tab index (1 -> 0, ... 9 -> 8).
 fn tab_jump_index(key: gdk::Key) -> Option<u32> {
     match key {
@@ -3716,4 +3768,42 @@ fn build_css(cfg: &config::Config) -> String {
         notebook_tab_width = NOTEBOOK_TAB_WIDTH,
         session_tab_width = SESSION_TAB_WIDTH,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attention_jump_prefers_waiting_tabs() {
+        let pages = [
+            (0, AgentState::Done),
+            (1, AgentState::Ready),
+            (2, AgentState::Busy),
+            (3, AgentState::Ready),
+        ];
+        // From tab 0, the first Ready tab after it wins — not the Done tab.
+        assert_eq!(attention_jump_target(&pages, 0), Some(1));
+        // Repeated presses walk all Ready tabs, wrapping around.
+        assert_eq!(attention_jump_target(&pages, 1), Some(3));
+        assert_eq!(attention_jump_target(&pages, 3), Some(1));
+    }
+
+    #[test]
+    fn attention_jump_falls_back_to_done_then_running() {
+        let pages = [(0, AgentState::Idle), (1, AgentState::Done)];
+        assert_eq!(attention_jump_target(&pages, 0), Some(1));
+        let pages = [(0, AgentState::Idle), (1, AgentState::AutoBusy)];
+        assert_eq!(attention_jump_target(&pages, 0), Some(1));
+    }
+
+    #[test]
+    fn attention_jump_none_when_nothing_to_do() {
+        assert_eq!(attention_jump_target(&[], 0), None);
+        let pages = [(0, AgentState::Idle), (1, AgentState::Idle)];
+        assert_eq!(attention_jump_target(&pages, 0), None);
+        // Only candidate is the current tab: stay put.
+        let pages = [(0, AgentState::Ready), (1, AgentState::Idle)];
+        assert_eq!(attention_jump_target(&pages, 0), None);
+    }
 }
