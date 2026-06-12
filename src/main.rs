@@ -215,7 +215,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
     let agent_panel = Rc::new(agentpanel::build());
 
     // Hosts panel (ssh config + teleport)
-    let hosts_panel = hostspanel::build();
+    let hosts_panel = Rc::new(hostspanel::build(cfg.borrow().hosts.show_teleport));
 
     // File tree page (header + scroll stacked vertically)
     let files_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -861,6 +861,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
         let root_widget: gtk4::Widget = root_box.clone().upcast();
         let last_cwd = Rc::clone(&last_cwd);
         let populate_tasks = Rc::clone(&populate_tasks);
+        let hosts_panel_r = Rc::clone(&hosts_panel);
         move || {
             let next = match config::Config::load_checked() {
                 Ok(c) => c,
@@ -875,6 +876,7 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 let cfg_ref = cfg.borrow();
                 css.load_from_string(&build_css(&cfg_ref));
                 apply_config_to_open_widgets(&root_widget, &cfg_ref);
+                hosts_panel_r.set_show_teleport(cfg_ref.hosts.show_teleport);
             }
 
             let cwd = last_cwd.borrow().clone();
