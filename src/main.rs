@@ -113,6 +113,10 @@ enum UiResult {
         title: String,
         result: Result<String, String>,
     },
+    Conflict {
+        title: String,
+        result: Result<String, String>,
+    },
     Push {
         result: Result<(), String>,
     },
@@ -649,6 +653,12 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                             diff::open_message("diff unavailable", &title, &message, &nb_c)
                         }
                     },
+                    UiResult::Conflict { title, result } => match result {
+                        Ok(content) => diff::open_conflict(&title, &content, &nb_c),
+                        Err(message) => {
+                            diff::open_message("conflict unavailable", &title, &message, &nb_c)
+                        }
+                    },
                     UiResult::Push { result } => match result {
                         Ok(()) => {
                             push_btn_c.set_label("↑  push");
@@ -801,12 +811,21 @@ fn build_ui(app: &Application, initial_dir: Option<&str>) {
                 let file = file.clone();
                 let title = file.rel_path.clone();
                 let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let result = git::repo_root(&cwd)
-                        .ok_or_else(|| "Not inside a git repository.".to_string())
-                        .and_then(|root| git::file_diff(&root, &file));
-                    let _ = tx.send_blocking(UiResult::Diff { title, result });
-                });
+                if file.status == git::GitStatus::Conflicted {
+                    std::thread::spawn(move || {
+                        let result = git::repo_root(&cwd)
+                            .ok_or_else(|| "Not inside a git repository.".to_string())
+                            .and_then(|root| git::conflict_file_content(&root, &file.rel_path));
+                        let _ = tx.send_blocking(UiResult::Conflict { title, result });
+                    });
+                } else {
+                    std::thread::spawn(move || {
+                        let result = git::repo_root(&cwd)
+                            .ok_or_else(|| "Not inside a git repository.".to_string())
+                            .and_then(|root| git::file_diff(&root, &file));
+                        let _ = tx.send_blocking(UiResult::Diff { title, result });
+                    });
+                }
             }
         });
     }

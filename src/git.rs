@@ -236,6 +236,16 @@ pub fn file_diff(root: &str, file: &GitFile) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "Diff is not valid UTF-8 text.".to_string())
 }
 
+/// Working-tree contents of a conflicted file. Unmerged paths can't be
+/// diffed against the index (`git diff` emits combined-diff format), so the
+/// viewer shows the raw file with its conflict markers instead.
+pub fn conflict_file_content(root: &str, rel_path: &str) -> Result<String, String> {
+    crate::limits::read_text_file_limited(
+        &format!("{root}/{rel_path}"),
+        crate::limits::MAX_DIFF_BYTES as u64,
+    )
+}
+
 pub fn current_branch(root: &str) -> Option<String> {
     Command::new("git")
         .args(["-C", root, "branch", "--show-current"])
